@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Tagwell
+GenericName=Music Tag Editor
+Comment=Edit the tags, cover art and lyrics of your music files
+# Change these paths to wherever you keep tagwell.py (or the AppImage).
+Exec=python3 /opt/tagwell/tagwell.py %F
+Icon=/opt/tagwell/tagwell.png
+Categories=AudioVideo;Audio;Utility;
+Keywords=tag;tags;tagger;metadata;id3;flac;mp3;music;cover;album art;lyrics;
+MimeType=audio/flac;audio/x-flac;audio/mpeg;audio/mp3;audio/mp4;audio/x-m4a;audio/m4a;audio/aac;audio/ogg;audio/x-vorbis+ogg;audio/vorbis;audio/opus;audio/x-opus+ogg;
+Terminal=false
+StartupWMClass=tagwell
