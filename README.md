@@ -5,7 +5,7 @@ FLAC, MP3, M4A (AAC/ALAC), OGG Vorbis and Opus files, one song or a whole album 
 
 [![Get it from the Snap Store](https://snapcraft.io/static/images/badges/en/snap-store-black.svg)](https://snapcraft.io/tagwell)
 
-![Tagwell showing the tags and cover of a track](docs/screenshot-tags.png)
+![Tagwell showing the tags and cover of a track](width="32%"docs/screenshot-tags.png)
 
 <img width="32%" alt="A whole album selected, with a preset showing missing tags" src="docs/screenshot-album-dark.png" />
 <img width="32%" alt="Finding a cover on the Cover Art Archive" src="docs/screenshot-find-cover.png" />
