@@ -4,11 +4,11 @@ A simple tag editor for your music on Linux. Edit the tags, cover art and lyrics
 FLAC, MP3, M4A (AAC/ALAC), OGG Vorbis and Opus files, one song or a whole album at a time.
 
 [![Get it from the Snap Store](https://snapcraft.io/static/images/badges/en/snap-store-black.svg)](https://snapcraft.io/tagwell)
-
-<img width="22%" alt="Tagwell showing the tags and cover of a track" src="docs/screenshot-tags.png">
-<img width="22%" alt="A whole album selected, with a preset showing missing tags" src="docs/screenshot-album-dark.png" />
-<img width="22%" alt="Finding a cover on the Cover Art Archive" src="docs/screenshot-find-cover.png" />
-<img width="22%" alt="Downloading lyrics from LRCLIB" src="docs/screenshot-lyrics-dark.png" />
+<p align="center">
+<img width="32%" alt="Tagwell showing the tags and cover of a track" src="docs/screenshot-tags.png">
+<img width="32%" alt="A whole album selected, with a preset showing missing tags" src="docs/screenshot-album-dark.png" />
+<img width="32%" alt="Finding a cover on the Cover Art Archive" src="docs/screenshot-find-cover.png" />
+<img width="32%" alt="Downloading lyrics from LRCLIB" src="docs/screenshot-lyrics-dark.png" /></p>
 
 
 ## Features
