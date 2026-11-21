@@ -219,7 +219,7 @@ class Pic:
 
 
 # ---------------------------------------------------------------- online covers
-USER_AGENT = "Tagwell/1.0 (desktop music tag editor for Linux)"
+USER_AGENT = "Tagwell/1.1 (https://github.com/bobwellapps/tagwell)"
 SIZES = ["Medium (500 px)", "Large (1200 px)", "Original (full size)"]
 SIZE_KEYS = ["medium", "large", "largest"]
 
@@ -345,6 +345,11 @@ class CoverSearchDialog(QDialog):
         lay.addWidget(self.status)
 
         bb = QDialogButtonBox()
+        self.web_btn = bb.addButton("Search the Web…", QDialogButtonBox.ResetRole)
+        self.web_btn.setIcon(icon("internet-web-browser", "edit-find"))
+        self.web_btn.setToolTip("Look for the cover in your web browser, then drag it in")
+        self.web_btn.setAutoDefault(False)
+        self.web_btn.clicked.connect(self.search_web)
         self.use_btn = bb.addButton("Use this cover", QDialogButtonBox.AcceptRole)
         self.use_btn.setEnabled(False)
         bb.addButton(QDialogButtonBox.Cancel)
@@ -438,14 +443,25 @@ class CoverSearchDialog(QDialog):
                    "Double-click one, or select it and press Use this cover.")
         elif self.error:
             msg = (f"Couldn't search the Cover Art Archive ({self.error}). "
-                   "Check your internet connection and try again.")
+                   "Check your internet connection and try again, or press Search the Web…")
         elif self.results:
             msg = ("Found the album, but nobody has uploaded a cover for it to the "
-                   "Cover Art Archive yet. Try a different spelling or edition.")
+                   "Cover Art Archive yet. Try a different edition, or press "
+                   "Search the Web… to find it in your browser.")
         else:
             msg = ("No matching albums found. Try fewer words, e.g. drop “Deluxe Edition” "
-                   "or “Remastered”, or check the spelling.")
+                   "or “Remastered”, check the spelling, or press Search the Web… "
+                   "to find the cover in your browser.")
         self.status.setText(msg)
+
+    def search_web(self):
+        words = " ".join(w for w in (self.artist_edit.text().strip(),
+                                     self.album_edit.text().strip()) if w)
+        data = PictureFinderDialog.ask(self, (words + " album cover").strip(),
+                                       search_now=bool(words))
+        if data:
+            self.image_data = data
+            self.accept()
 
     # ---- choosing
     def use_selected(self):
@@ -483,6 +499,425 @@ class CoverSearchDialog(QDialog):
         self.search_id += 1  # ignore anything still arriving
         self.pool.shutdown(wait=False, cancel_futures=True)
         super().done(result)
+
+
+# ---------------------------------------------------------------- pictures from the web
+# Based on the webimage kit (as used in Musicwell). Tagwell never searches image sites
+# itself: it opens an image search in the person's own web browser, and they drag the
+# picture they want into Tagwell, paste it, or choose a file.
+import threading
+from PySide6.QtGui import QDesktopServices, QGuiApplication, QShortcut
+
+WEB_ENGINES = {
+    "duckduckgo": ("DuckDuckGo", "https://duckduckgo.com/?iax=images&ia=images&q={q}"),
+    "google": ("Google", "https://www.google.com/search?tbm=isch&q={q}"),
+    "bing": ("Bing", "https://www.bing.com/images/search?q={q}"),
+}
+DEFAULT_WEB_ENGINE = "duckduckgo"
+WEB_MAX_BYTES = 15 * 1024 * 1024
+WEB_MAX_SIDE = 1600   # bigger pictures are made smaller before they go into the files
+WEB_SMALL = 300       # smaller than this: still used, but Tagwell says it's small
+# drags from Tagwell's own lists and tables are never taken as pictures
+_OWN_DRAG_FORMATS = ["application/x-qabstractitemmodeldatalist"]
+
+
+def tagwell_settings():
+    return QSettings(os.path.join(os.path.dirname(presets_path()), "tagwell.conf"),
+                     QSettings.IniFormat)
+
+
+def web_engine(settings):
+    e = str(settings.value("web/image_engine", DEFAULT_WEB_ENGINE) or DEFAULT_WEB_ENGINE)
+    return e if e in WEB_ENGINES else DEFAULT_WEB_ENGINE
+
+
+def web_search_url(words, engine=DEFAULT_WEB_ENGINE):
+    url = WEB_ENGINES.get(engine, WEB_ENGINES[DEFAULT_WEB_ENGINE])[1]
+    return url.format(q=urllib.parse.quote_plus(words.strip()))
+
+
+def open_web_search(words, engine=DEFAULT_WEB_ENGINE):
+    """Opens the person's web browser on an image search for these words."""
+    return open_in_browser(web_search_url(words, engine))
+
+
+def open_in_browser(url):
+    if getattr(sys, "frozen", False):
+        # The AppImage points the library path at its own bundled libraries; the web
+        # browser must start with the system's own, so give it the original settings.
+        import subprocess
+        env = dict(os.environ)
+        orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if orig:
+            env["LD_LIBRARY_PATH"] = orig
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+        try:
+            subprocess.Popen(["xdg-open", url], env=env, start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except OSError:
+            pass
+    return QDesktopServices.openUrl(QUrl(url))
+
+
+def web_accepts(mime):
+    """Is there a picture (or a picture's web address) in this drag or the clipboard?"""
+    if mime is None or any(mime.hasFormat(f) for f in _OWN_DRAG_FORMATS):
+        return False
+    if mime.hasImage():
+        return True
+    if mime.hasUrls() and any(u.scheme() in ("http", "https", "data") for u in mime.urls()):
+        return True
+    if mime.hasHtml() and "<img" in mime.html().lower():
+        return True
+    if mime.hasText() and re.match(r"\s*(https?://|data:image/)\S+\s*$", mime.text() or ""):
+        return True
+    return False
+
+
+def _web_unwrap(url):
+    """A search result's link -> the picture itself (Google imgurl=, Bing mediaurl=, DDG u=)."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        qs = urllib.parse.parse_qs(parts.query)
+    except ValueError:
+        return url
+    for k in ("imgurl", "mediaurl", "u", "img_url", "image_url"):
+        v = qs.get(k)
+        if v and v[0].lower().startswith(("http://", "https://")):
+            if k != "u" or "duckduckgo" in (parts.hostname or ""):
+                return v[0]
+    return url
+
+
+def _web_looks_like_image(url):
+    return bool(re.search(r"\.(jpe?g|png|webp|gif|bmp|avif)(\?|#|$)", url, re.I))
+
+
+def _encode_image(img, fmt="JPEG"):
+    buf = QBuffer()
+    buf.open(QIODevice.WriteOnly)
+    img.save(buf, fmt, 92 if fmt == "JPEG" else -1)
+    buf.close()
+    return bytes(buf.data())
+
+
+def web_extract(mime):
+    """Everything usable in a drop or the clipboard, taken now (a drag's data is gone
+    afterwards): {"urls": [best first], "files": [paths], "data": PNG bytes or b""}."""
+    if not web_accepts(mime):
+        return None
+    urls, files = [], []
+    if mime.hasUrls():
+        for u in mime.urls():
+            if u.isLocalFile():
+                files.append(u.toLocalFile())
+            elif u.scheme() in ("http", "https", "data"):
+                urls.append(u.toString())
+    if mime.hasHtml():
+        for src in re.findall(r"""<img[^>]+src\s*=\s*["']([^"']+)["']""", mime.html(), re.I):
+            urls.append(src.replace("&amp;", "&"))
+    if mime.hasText():
+        t = (mime.text() or "").strip()
+        if re.match(r"(https?://|data:image/)\S+$", t):
+            urls.append(t)
+    full = [_web_unwrap(u) for u in urls]
+    # the full-size picture behind a search result first, then pictures' own
+    # addresses, then web pages, then data: pictures
+    ranked = sorted(dict.fromkeys(full), key=lambda u: (
+        0 if u not in urls else 1 if _web_looks_like_image(u)
+        else 3 if u.startswith("data:") else 2))
+    data = b""
+    if mime.hasImage():
+        img = mime.imageData()
+        if isinstance(img, QImage) and not img.isNull():
+            data = _encode_image(img, "PNG")
+    return {"urls": ranked, "files": files, "data": data}
+
+
+def web_tidy(data):
+    """A picture Tagwell can read? Then as a JPEG (or PNG, if it has see-through parts),
+    at most WEB_MAX_SIDE pixels on its longest side."""
+    img = QImage.fromData(data)
+    if img.isNull():
+        return None
+    if max(img.width(), img.height()) > WEB_MAX_SIDE:
+        img = img.scaled(WEB_MAX_SIDE, WEB_MAX_SIDE, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    elif data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n":
+        return data  # already a JPEG or PNG of a fine size
+    return _encode_image(img, "PNG" if img.hasAlphaChannel() else "JPEG")
+
+
+def _web_page_picture(html, base):
+    """A web page dropped instead of its picture: the picture it shares itself with."""
+    for pat in (r"""<meta[^>]+(?:property|name)\s*=\s*["'](?:og:image|og:image:url|twitter:image)["'][^>]*content\s*=\s*["']([^"']+)""",
+                r"""<meta[^>]+content\s*=\s*["']([^"']+)["'][^>]*(?:property|name)\s*=\s*["'](?:og:image|twitter:image)["']"""):
+        m = re.search(pat, html, re.I)
+        if m:
+            return urllib.parse.urljoin(base, m.group(1).replace("&amp;", "&"))
+    return ""
+
+
+def web_fetch(found):
+    """(picture bytes, "") or (b"", why not). Runs in a background thread."""
+    why = ""
+    for f in found.get("files", []):
+        try:
+            with open(f, "rb") as fh:
+                data = fh.read(WEB_MAX_BYTES)
+        except OSError as e:
+            why = f"couldn't read {os.path.basename(f)}: {e.strerror or e}"
+            continue
+        t = web_tidy(data)
+        if t:
+            return t, ""
+        why = f"{os.path.basename(f)} isn't a picture Tagwell can read"
+    for url in found.get("urls", [])[:6]:
+        if url.startswith("data:"):
+            m = re.match(r"data:image/[\w.+-]+;base64,(.*)$", url, re.S)
+            if m:
+                try:
+                    t = web_tidy(base64.b64decode(m.group(1)))
+                except (ValueError, TypeError):
+                    t = None
+                if t:
+                    return t, ""
+            continue
+        try:
+            data = http_get(url, timeout=15, limit=WEB_MAX_BYTES)
+        except Exception as e:
+            why = f"the picture couldn't be downloaded ({_friendly_error(e)})"
+            continue
+        t = web_tidy(data)
+        if t:
+            return t, ""
+        head = data[:400000].decode("utf-8", "replace")
+        if "<html" in head.lower() or "<meta" in head.lower():
+            pic = _web_page_picture(head, url)
+            if pic:
+                try:
+                    t = web_tidy(http_get(pic, timeout=15, limit=WEB_MAX_BYTES))
+                except Exception:
+                    t = None
+                if t:
+                    return t, ""
+            why = ("that's a web page, not a picture. Open the picture itself "
+                   "(right-click it, Open Image in New Tab) and drag or copy that")
+        else:
+            why = "that isn't a picture Tagwell can read"
+    if found.get("data"):
+        t = web_tidy(found["data"])
+        if t:
+            return t, ""
+    return b"", why or "there's no picture in it"
+
+
+class WebPictureTaker(QObject):
+    """Fetches a dropped or pasted picture in the background; done / failed arrive on
+    the main thread. done(picture bytes, note), e.g. note "it's quite small (120 × 90)"."""
+    done = Signal(bytes, str)
+    failed = Signal(str)
+    _live = set()
+
+    def __init__(self, found, parent=None):
+        super().__init__(parent)
+        WebPictureTaker._live.add(self)
+        self.found = found
+
+    def start(self):
+        def work():
+            try:
+                data, why = web_fetch(self.found)
+            except Exception as e:  # never let a drop crash the app
+                data, why = b"", str(e)
+            if data:
+                img = QImage.fromData(data)
+                note = (f"it's quite small ({img.width()} × {img.height()})"
+                        if not img.isNull() and max(img.width(), img.height()) < WEB_SMALL
+                        else "")
+                self.done.emit(data, note)
+            else:
+                self.failed.emit(why)
+            WebPictureTaker._live.discard(self)
+        threading.Thread(target=work, name="webpicture", daemon=True).start()
+        return self
+
+
+class _PictureDropArea(QLabel):
+    def __init__(self, finder):
+        super().__init__()
+        self.finder = finder
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(340, 260)
+        self.setWordWrap(True)
+        self.setAcceptDrops(True)
+        self.setObjectName("dropArea")
+        self.setStyleSheet("QLabel#dropArea { border: 2px dashed palette(mid); "
+                           "border-radius: 10px; padding: 12px; }")
+        self.setText("Drag a picture here from your web browser or a folder\n\n"
+                     "or right-click it in the browser, Copy Image, then press Paste")
+
+    @staticmethod
+    def _ok(mime):
+        return web_accepts(mime) or (mime.hasUrls() and any(
+            u.isLocalFile() for u in mime.urls()))
+
+    def dragEnterEvent(self, ev):
+        if self._ok(ev.mimeData()):
+            ev.setDropAction(Qt.CopyAction)
+            ev.accept()
+        else:
+            ev.ignore()
+
+    def dragMoveEvent(self, ev):
+        self.dragEnterEvent(ev)
+
+    def dropEvent(self, ev):
+        md = ev.mimeData()
+        found = web_extract(md) or {
+            "urls": [], "data": b"",
+            "files": [u.toLocalFile() for u in md.urls() if u.isLocalFile()]}
+        ev.setDropAction(Qt.CopyAction)
+        ev.accept()
+        self.finder.take(found)
+
+
+class PictureFinderDialog(QDialog):
+    """Pick a picture from a web search in the person's browser (dragged or pasted in),
+    or from a file."""
+
+    def __init__(self, parent=None, words="", title="Search the web for a cover",
+                 search_now=False):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(560)
+        self.settings = tagwell_settings()
+        self.data = b""
+        self._taker = None
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 14)
+        lay.setSpacing(10)
+        intro = QLabel("Search for the picture in your web browser, then drag the one you "
+                       "want into the box below (or copy it and press Paste). You can also "
+                       "choose a picture file.")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+
+        row = QHBoxLayout()
+        self.words = QLineEdit(words)
+        self.words.setPlaceholderText("What to search for")
+        self.words.returnPressed.connect(self.search)
+        self.engine = QComboBox()
+        for key, (name, _url) in WEB_ENGINES.items():
+            self.engine.addItem(name, key)
+        self.engine.setCurrentIndex(max(0, self.engine.findData(web_engine(self.settings))))
+        self.engine.setToolTip("Search engine (remembered for next time)")
+        self.engine.currentIndexChanged.connect(
+            lambda: self.settings.setValue("web/image_engine", self.engine.currentData()))
+        search = QPushButton(icon("internet-web-browser", "edit-find"), "Search the Web")
+        search.setAutoDefault(False)
+        search.clicked.connect(self.search)
+        row.addWidget(self.words, 1)
+        row.addWidget(self.engine)
+        row.addWidget(search)
+        lay.addLayout(row)
+
+        self.area = _PictureDropArea(self)
+        lay.addWidget(self.area, 1)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        btns = QHBoxLayout()
+        paste = QPushButton(icon("edit-paste"), "Paste")
+        paste.setAutoDefault(False)
+        paste.setToolTip("A picture (or a picture's address) you copied (Ctrl+V)")
+        paste.clicked.connect(self.paste)
+        sc = QShortcut(QKeySequence.Paste, self)
+        sc.activated.connect(self._paste_key)
+        choose = QPushButton(icon("document-open"), "Choose a File…")
+        choose.setAutoDefault(False)
+        choose.clicked.connect(self.choose)
+        btns.addWidget(paste)
+        btns.addWidget(choose)
+        btns.addStretch(1)
+        self.box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.ok_btn = self.box.button(QDialogButtonBox.Ok)
+        self.ok_btn.setText("Use this Picture")
+        self.ok_btn.setEnabled(False)
+        self.box.accepted.connect(self.accept)
+        self.box.rejected.connect(self.reject)
+        btns.addWidget(self.box)
+        lay.addLayout(btns)
+        self.resize(660, 580)
+        if search_now and words.strip():
+            QTimer.singleShot(150, self.search)  # straight to the browser
+
+    def search(self):
+        words = self.words.text().strip()
+        if not words:
+            self._say("Type what to search for first, for example the artist and album.")
+            return
+        if open_web_search(words, self.engine.currentData()):
+            self._say("Your web browser should now show the search. Drag the picture you "
+                      "want into the box above.")
+        else:
+            self._say("Couldn't open your web browser.")
+
+    def _paste_key(self):
+        if self.focusWidget() is self.words:
+            self.words.paste()  # Ctrl+V in the search box pastes text there
+        else:
+            self.paste()
+
+    def paste(self):
+        md = QGuiApplication.clipboard().mimeData()
+        found = web_extract(md)
+        if not found and md is not None and md.hasUrls():
+            files = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
+            if files:
+                found = {"urls": [], "files": files, "data": b""}
+        if found:
+            self.take(found)
+        else:
+            self._say("There's no picture on the clipboard. In the browser, right-click the "
+                      "picture and choose Copy Image (or Copy Image Link).")
+
+    def choose(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose a picture", os.path.expanduser("~"),
+            "Pictures (*.jpg *.jpeg *.png *.webp *.bmp *.gif);;All files (*)")
+        if path:
+            self.take({"urls": [], "files": [path], "data": b""})
+
+    def take(self, found):
+        self._say("Getting the picture…")
+        self._taker = WebPictureTaker(found, self)
+        self._taker.done.connect(self._got)
+        self._taker.failed.connect(lambda why: self._say(f"Couldn't use that: {why}."))
+        self._taker.start()
+
+    def _got(self, data, note):
+        pm = QPixmap()
+        pm.loadFromData(data)
+        self.data = data
+        self.area.setPixmap(pm.scaled(self.area.contentsRect().size() * 0.94,
+                                      Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self._say(f"Got it: {pm.width()} × {pm.height()}"
+                  + (f", {note}" if note else "") + ".")
+        self.ok_btn.setEnabled(True)
+        self.ok_btn.setDefault(True)
+
+    def _say(self, text):
+        self.status.setText(text)
+
+    @classmethod
+    def ask(cls, parent=None, words="", title="Search the web for a cover", search_now=False):
+        """Shows the window; the picture's bytes (JPEG or PNG), or None if cancelled.
+        search_now: open the browser on the search straight away."""
+        dlg = cls(parent, words, title, search_now)
+        return dlg.data if dlg.exec() == QDialog.Accepted and dlg.data else None
 
 
 # ---------------------------------------------------------------- online lyrics
@@ -1471,7 +1906,7 @@ class PresetDialog(QDialog):
 
 
 # ---------------------------------------------------------------- window
-VERSION = "1.0"
+VERSION = "1.1"
 
 # ---------------------------------------------------------------- look and feel
 APP_NAME = "Tagwell"
@@ -2370,7 +2805,7 @@ class TagEditor(QMainWindow):
         self.cover_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.cover_label.setWordWrap(True)
         self.cover_label.setToolTip("Double-click to view full size.\n"
-                                    "Drop an image file here (or on the window) to import it.")
+                                    "Drop a picture here from a folder or your web browser to import it.")
         self.cover_label.installEventFilter(self)
         v.addWidget(self.cover_label, 1)
 
@@ -2560,6 +2995,15 @@ class TagEditor(QMainWindow):
             self.import_picture(path)
 
     def import_picture(self, path):
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as e:
+            QMessageBox.warning(self, "Import picture", f"Couldn't read that image:\n{e}")
+            return
+        self.import_picture_data(data)
+
+    def import_picture_data(self, data, note=""):
         files = self.selected_files()
         if not files:
             QMessageBox.information(self, "Import picture",
@@ -2579,7 +3023,7 @@ class TagEditor(QMainWindow):
                 return
             ptype = PICTURE_TYPES.index(choice)
         try:
-            pic = Pic.from_file(path, ptype)
+            pic = Pic.from_bytes(data, ptype)
         except (OSError, ValueError) as e:
             QMessageBox.warning(self, "Import picture", f"Couldn't use that image:\n{e}")
             return
@@ -2589,7 +3033,8 @@ class TagEditor(QMainWindow):
         self.cover_index = next((i for i, p in enumerate(new) if p == pic), 0)
         n = len(files)
         self._pictures_changed(
-            f"{type_name(ptype)} imported into {n} file{'s' if n != 1 else ''}")
+            f"{type_name(ptype)} imported into {n} file{'s' if n != 1 else ''}"
+            + (f" ({note})" if note else ""))
 
     def _common_value(self, files, *keys):
         """The first of `keys` the files have, using the most common value."""
@@ -3394,7 +3839,9 @@ class TagEditor(QMainWindow):
                   f"urls={[u.toString() for u in md.urls()]}", file=sys.stderr, flush=True)
 
     def _can_take(self, md):
-        return md.hasUrls() or md.hasFormat(self.PORTAL_MIME) or (
+        if any(md.hasFormat(f) for f in _OWN_DRAG_FORMATS):
+            return False
+        return md.hasUrls() or md.hasFormat(self.PORTAL_MIME) or web_accepts(md) or (
             md.hasText() and md.text().strip().startswith(("file://", "/")))
 
     def dragEnterEvent(self, event):
@@ -3451,6 +3898,9 @@ class TagEditor(QMainWindow):
                     paths.append(line)
         event.setDropAction(Qt.CopyAction)
         event.accept()
+        if not paths and web_accepts(md):
+            self._take_web_picture(web_extract(md))
+            return
         if not paths:
             QMessageBox.information(
                 self, "Drag and drop",
@@ -3463,6 +3913,26 @@ class TagEditor(QMainWindow):
             self.add_paths(others)
         if images:
             self.import_picture(images[0])
+
+    def _take_web_picture(self, found):
+        """A picture dragged in from a web browser: download it, then import it."""
+        if not self.selected_files():
+            QMessageBox.information(self, "Import picture",
+                                    "Select the file(s) to add the picture to first.")
+            return
+        self.statusBar().showMessage("Getting the picture…")
+        taker = WebPictureTaker(found, self)
+
+        def done(data, note):
+            self.statusBar().clearMessage()
+            self.import_picture_data(data, note)
+
+        def failed(why):
+            self.statusBar().clearMessage()
+            QMessageBox.warning(self, "Import picture", f"Couldn't use that: {why}.")
+        taker.done.connect(done)
+        taker.failed.connect(failed)
+        taker.start()
 
 
 # ---------------------------------------------------------------- single instance

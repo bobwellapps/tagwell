@@ -4,12 +4,12 @@ A simple tag editor for your music on Linux. Edit the tags, cover art and lyrics
 FLAC, MP3, M4A (AAC/ALAC), OGG Vorbis and Opus files, one song or a whole album at a time.
 
 [![Get it from the Snap Store](https://snapcraft.io/static/images/badges/en/snap-store-black.svg)](https://snapcraft.io/tagwell)
-<p align="center">
-<img width="32%" alt="Tagwell showing the tags and cover of a track" src="docs/screenshot-tags.png">
+
+![Tagwell showing the tags and cover of a track](docs/screenshot-tags.png)
+
 <img width="32%" alt="A whole album selected, with a preset showing missing tags" src="docs/screenshot-album-dark.png" />
 <img width="32%" alt="Finding a cover on the Cover Art Archive" src="docs/screenshot-find-cover.png" />
-<img width="32%" alt="Downloading lyrics from LRCLIB" src="docs/screenshot-lyrics-dark.png" /></p>
-
+<img width="32%" alt="Downloading lyrics from LRCLIB" src="docs/screenshot-lyrics-dark.png" />
 
 ## Features
 
@@ -21,6 +21,8 @@ FLAC, MP3, M4A (AAC/ALAC), OGG Vorbis and Opus files, one song or a whole album 
 - Choose whether blank tags are saved or left out
 - Cover art: view, import, export, remove and set the picture type, or find covers online
   from the [Cover Art Archive](https://coverartarchive.org) (MusicBrainz)
+- Not in the Cover Art Archive? Search the web for the cover in your own browser, then drag
+  the picture into Tagwell or copy and paste it
 - Lyrics: download plain or time-synced lyrics from [LRCLIB](https://lrclib.net)
 - Drag files or folders onto the window, or open several files from your file manager into
   the same window
@@ -78,6 +80,7 @@ entry is in `packaging/tagwell.desktop`.
 | Select several tags | Ctrl-click, Shift-click, or drag across them |
 | Use a preset | Pick it from the Preset list; New… makes one from scratch |
 | Change the cover | Import…, Export…, Remove or Find Cover Online… under the picture |
+| Use a cover from the web | Find Cover Online… → Search the Web…, then drag the picture in; or drag a picture from your browser straight onto Tagwell |
 | Get lyrics | Lyrics… under the tag list |
 | Save | Save, or Ctrl+S (saves every changed file) |
 
