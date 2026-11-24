@@ -1,67 +1,60 @@
 #!/usr/bin/env python3
-"""
-Tagwell - a simple music tag editor (tags, cover art, lyrics) for
-FLAC, MP3, M4A (AAC/ALAC), OGG Vorbis and Opus files.
+"""Tagwell - a simple tag editor for FLAC, MP3, M4A, OGG and Opus files:
+tags, cover art and lyrics.
 
-Open one or many music files, select one or several in the list, and add,
-edit, rename or remove tags. Changes apply to every selected file.
-
-Requirements:
-    pip install PySide6 mutagen
-
-Run:
-    python3 tagwell.py [music file | folder ...]
+Needs PySide6 and mutagen (pip install PySide6 mutagen).
+Run: python3 tagwell.py [files or folders]
 """
 
-import sys
+import base64
+import json
 import os
 import re
-import json
-import base64
 import ssl
-import urllib.request
-import urllib.parse
+import subprocess
+import sys
+import threading
 import urllib.error
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 from mutagen import MutagenError
 from mutagen.flac import FLAC, Picture
-from PySide6.QtCore import Qt, QRegularExpression, QTimer, QBuffer, QIODevice
-from PySide6.QtGui import (QAction, QKeySequence, QRegularExpressionValidator, QFont,
-                           QColor, QImage, QPixmap)
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QTableWidget, QTableWidgetItem, QPushButton, QFileDialog,
-    QMessageBox, QHeaderView, QLabel, QComboBox, QAbstractItemView,
-    QStyledItemDelegate, QLineEdit, QCompleter, QInputDialog,
-    QListWidget, QListWidgetItem, QSplitter, QDialog, QDialogButtonBox,
-    QFormLayout, QSizePolicy, QFrame, QScrollArea, QCheckBox, QListView,
-    QPlainTextEdit, QTreeWidget, QTreeWidgetItem, QRadioButton, QProgressBar,
-    QStyle,
+from PySide6.QtCore import (
+    QBuffer, QDir, QEvent, QIODevice, QItemSelection, QItemSelectionModel, QLockFile,
+    QObject, QRect, QRectF, QRegularExpression, QSettings, QSize, Qt, QTimer, QUrl,
+    qVersion, Signal,
 )
-from PySide6.QtCore import QEvent, QObject, Signal, QSize, QLockFile, QDir
+from PySide6.QtGui import (
+    QAction, QColor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QIcon,
+    QImage, QKeySequence, QPainter, QPainterPath, QPalette, QPen, QPixmap,
+    QRegularExpressionValidator, QShortcut,
+)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtGui import (QIcon, QPalette, QPainter, QPainterPath, QPen,
-                           QFontMetrics)
-from PySide6.QtCore import QUrl, QRectF, QSettings, qVersion, QRect, QItemSelection, QItemSelectionModel
-from PySide6.QtWidgets import (QStyleOptionViewItem, QToolBar, QToolButton,
-                               QStackedWidget, QMenu, QRubberBand)
+from PySide6.QtWidgets import (
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QCompleter, QDialog,
+    QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView,
+    QInputDialog, QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem,
+    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton,
+    QRubberBand, QScrollArea, QSizePolicy, QSplitter, QStackedWidget, QStyle,
+    QStyledItemDelegate, QStyleOptionViewItem, QTableWidget, QTableWidgetItem,
+    QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+)
 
-# Common tag names offered in the dropdowns; any custom name can be typed in.
+# Suggested in the tag name lists; any other name can be typed.
 COMMON_TAGS = [
     "TITLE", "ARTIST", "ALBUM", "ALBUMARTIST", "TRACKNUMBER", "TOTALTRACKS",
     "DISCNUMBER", "TOTALDISCS", "DATE", "GENRE", "COMPOSER", "PERFORMER",
     "COMMENT", "DESCRIPTION", "LYRICS", "ISRC", "LABEL", "COPYRIGHT",
 ]
 
-# Old names replaced by TOTALTRACKS / TOTALDISCS: never offered in any tag list,
-# even when a loaded file or preset still uses them.
+# Replaced by TOTALTRACKS / TOTALDISCS, so never suggested.
 NEVER_SUGGEST = {"TRACKTOTAL", "DISCTOTAL"}
 
 MIXED_TEXT = "<different in each file>"
 
-# Tags that hold several lines of text. These (and any value containing a line
-# break) are edited in a text window instead of inside the table cell.
+# Multi-line tags, edited in a text window instead of the table cell.
 LONG_TEXT_TAGS = {"LYRICS", "UNSYNCEDLYRICS", "SYNCEDLYRICS"}
 FULL_TEXT = Qt.UserRole + 1
 
@@ -112,10 +105,11 @@ class TextEditDialog(QDialog):
 
     def text(self):
         return self.edit.toPlainText()
-META = Qt.UserRole  # row info stored on the Tag cell: ("same", key, i) or ("mixed", key)
+# Row info on the Tag cell: ("same", key, i), ("mixed", key) or ("missing", key)
+META = Qt.UserRole
 
 
-# A time-synced lyrics line, e.g. "[01:23.45] some words"
+# Synced lyrics line, e.g. "[01:23.45] some words"
 LRC_LINE = re.compile(r"^\s*\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]", re.M)
 
 
@@ -125,13 +119,13 @@ def natural_key(path):
 
 
 def valid_tag_name(name: str) -> bool:
-    """Vorbis comment field names: printable ASCII 0x20-0x7D, no '='."""
+    """Vorbis comment rules: ASCII 0x20-0x7D, no '='."""
     if not name:
         return False
     return all(0x20 <= ord(c) <= 0x7D and c != "=" for c in name)
 
 
-# Only characters allowed in a tag name can be typed (ASCII 0x20-0x7D, no '=').
+# Characters allowed in a tag name: ASCII 0x20-0x7D except '='.
 TAG_NAME_REGEX = QRegularExpression(r"[\x20-\x3C\x3E-\x7D]+")
 
 
@@ -174,11 +168,6 @@ class Pic:
         return cls(p.type, p.mime, p.desc, p.width, p.height, p.depth, bytes(p.data))
 
     @classmethod
-    def from_file(cls, path, ptype):
-        with open(path, "rb") as fh:
-            return cls.from_bytes(fh.read(), ptype)
-
-    @classmethod
     def from_bytes(cls, data, ptype):
         img = QImage.fromData(data)
         if img.isNull():
@@ -219,7 +208,7 @@ class Pic:
 
 
 # ---------------------------------------------------------------- online covers
-USER_AGENT = "Tagwell/1.1 (https://github.com/bobwellapps/tagwell)"
+USER_AGENT = "Tagwell/1.2 (https://github.com/bobwellapps/tagwell)"
 SIZES = ["Medium (500 px)", "Large (1200 px)", "Original (full size)"]
 SIZE_KEYS = ["medium", "large", "largest"]
 
@@ -502,11 +491,8 @@ class CoverSearchDialog(QDialog):
 
 
 # ---------------------------------------------------------------- pictures from the web
-# Based on the webimage kit (as used in Musicwell). Tagwell never searches image sites
-# itself: it opens an image search in the person's own web browser, and they drag the
-# picture they want into Tagwell, paste it, or choose a file.
-import threading
-from PySide6.QtGui import QDesktopServices, QGuiApplication, QShortcut
+# Tagwell doesn't search image sites itself: it opens the search in the user's
+# browser, and they drag or paste the picture in.
 
 WEB_ENGINES = {
     "duckduckgo": ("DuckDuckGo", "https://duckduckgo.com/?iax=images&ia=images&q={q}"),
@@ -515,9 +501,9 @@ WEB_ENGINES = {
 }
 DEFAULT_WEB_ENGINE = "duckduckgo"
 WEB_MAX_BYTES = 15 * 1024 * 1024
-WEB_MAX_SIDE = 1600   # bigger pictures are made smaller before they go into the files
-WEB_SMALL = 300       # smaller than this: still used, but Tagwell says it's small
-# drags from Tagwell's own lists and tables are never taken as pictures
+WEB_MAX_SIDE = 1600   # bigger pictures are scaled down to this
+WEB_SMALL = 300       # smaller than this gets a "quite small" note
+# drags from Tagwell's own lists
 _OWN_DRAG_FORMATS = ["application/x-qabstractitemmodeldatalist"]
 
 
@@ -537,15 +523,13 @@ def web_search_url(words, engine=DEFAULT_WEB_ENGINE):
 
 
 def open_web_search(words, engine=DEFAULT_WEB_ENGINE):
-    """Opens the person's web browser on an image search for these words."""
     return open_in_browser(web_search_url(words, engine))
 
 
 def open_in_browser(url):
     if getattr(sys, "frozen", False):
-        # The AppImage points the library path at its own bundled libraries; the web
-        # browser must start with the system's own, so give it the original settings.
-        import subprocess
+        # In the AppImage, LD_LIBRARY_PATH points at bundled libraries, which can
+        # stop the browser starting.
         env = dict(os.environ)
         orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
         if orig:
@@ -562,7 +546,7 @@ def open_in_browser(url):
 
 
 def web_accepts(mime):
-    """Is there a picture (or a picture's web address) in this drag or the clipboard?"""
+    """True if the drag or clipboard holds a picture or a picture's address."""
     if mime is None or any(mime.hasFormat(f) for f in _OWN_DRAG_FORMATS):
         return False
     if mime.hasImage():
@@ -577,7 +561,7 @@ def web_accepts(mime):
 
 
 def _web_unwrap(url):
-    """A search result's link -> the picture itself (Google imgurl=, Bing mediaurl=, DDG u=)."""
+    """Search result link -> the picture's own address."""
     try:
         parts = urllib.parse.urlsplit(url)
         qs = urllib.parse.parse_qs(parts.query)
@@ -604,8 +588,7 @@ def _encode_image(img, fmt="JPEG"):
 
 
 def web_extract(mime):
-    """Everything usable in a drop or the clipboard, taken now (a drag's data is gone
-    afterwards): {"urls": [best first], "files": [paths], "data": PNG bytes or b""}."""
+    """Take everything usable from a drop or the clipboard (a drag's data is gone afterwards)."""
     if not web_accepts(mime):
         return None
     urls, files = [], []
@@ -623,8 +606,7 @@ def web_extract(mime):
         if re.match(r"(https?://|data:image/)\S+$", t):
             urls.append(t)
     full = [_web_unwrap(u) for u in urls]
-    # the full-size picture behind a search result first, then pictures' own
-    # addresses, then web pages, then data: pictures
+    # full-size picture behind a search result, then image URLs, pages, data: URLs
     ranked = sorted(dict.fromkeys(full), key=lambda u: (
         0 if u not in urls else 1 if _web_looks_like_image(u)
         else 3 if u.startswith("data:") else 2))
@@ -637,8 +619,7 @@ def web_extract(mime):
 
 
 def web_tidy(data):
-    """A picture Tagwell can read? Then as a JPEG (or PNG, if it has see-through parts),
-    at most WEB_MAX_SIDE pixels on its longest side."""
+    """The picture as JPEG/PNG, at most WEB_MAX_SIDE pixels, or None if it isn't one."""
     img = QImage.fromData(data)
     if img.isNull():
         return None
@@ -650,9 +631,10 @@ def web_tidy(data):
 
 
 def _web_page_picture(html, base):
-    """A web page dropped instead of its picture: the picture it shares itself with."""
-    for pat in (r"""<meta[^>]+(?:property|name)\s*=\s*["'](?:og:image|og:image:url|twitter:image)["'][^>]*content\s*=\s*["']([^"']+)""",
-                r"""<meta[^>]+content\s*=\s*["']([^"']+)["'][^>]*(?:property|name)\s*=\s*["'](?:og:image|twitter:image)["']"""):
+    """The og:image / twitter:image of a web page."""
+    name = r"""(?:property|name)\s*=\s*["'](?:og:image|og:image:url|twitter:image)["']"""
+    content = r"""content\s*=\s*["']([^"']+)["']?"""
+    for pat in (rf"<meta[^>]+{name}[^>]*{content}", rf"<meta[^>]+{content}[^>]*{name}"):
         m = re.search(pat, html, re.I)
         if m:
             return urllib.parse.urljoin(base, m.group(1).replace("&amp;", "&"))
@@ -660,7 +642,7 @@ def _web_page_picture(html, base):
 
 
 def web_fetch(found):
-    """(picture bytes, "") or (b"", why not). Runs in a background thread."""
+    """Returns (picture bytes, "") or (b"", reason). Runs in a thread."""
     why = ""
     for f in found.get("files", []):
         try:
@@ -714,8 +696,7 @@ def web_fetch(found):
 
 
 class WebPictureTaker(QObject):
-    """Fetches a dropped or pasted picture in the background; done / failed arrive on
-    the main thread. done(picture bytes, note), e.g. note "it's quite small (120 × 90)"."""
+    """Fetches a dropped or pasted picture in a background thread."""
     done = Signal(bytes, str)
     failed = Signal(str)
     _live = set()
@@ -729,7 +710,7 @@ class WebPictureTaker(QObject):
         def work():
             try:
                 data, why = web_fetch(self.found)
-            except Exception as e:  # never let a drop crash the app
+            except Exception as e:  # a bad drop must not crash the app
                 data, why = b"", str(e)
             if data:
                 img = QImage.fromData(data)
@@ -784,8 +765,7 @@ class _PictureDropArea(QLabel):
 
 
 class PictureFinderDialog(QDialog):
-    """Pick a picture from a web search in the person's browser (dragged or pasted in),
-    or from a file."""
+    """Pick a cover from a browser search (dragged or pasted in) or a file."""
 
     def __init__(self, parent=None, words="", title="Search the web for a cover",
                  search_now=False):
@@ -852,7 +832,7 @@ class PictureFinderDialog(QDialog):
         lay.addLayout(btns)
         self.resize(660, 580)
         if search_now and words.strip():
-            QTimer.singleShot(150, self.search)  # straight to the browser
+            QTimer.singleShot(150, self.search)
 
     def search(self):
         words = self.words.text().strip()
@@ -914,8 +894,7 @@ class PictureFinderDialog(QDialog):
 
     @classmethod
     def ask(cls, parent=None, words="", title="Search the web for a cover", search_now=False):
-        """Shows the window; the picture's bytes (JPEG or PNG), or None if cancelled.
-        search_now: open the browser on the search straight away."""
+        """Show the dialog; returns the picture bytes, or None."""
         dlg = cls(parent, words, title, search_now)
         return dlg.data if dlg.exec() == QDialog.Accepted and dlg.data else None
 
@@ -935,7 +914,6 @@ def lrc_to_plain(synced):
 
 
 def _lrclib_pick(found):
-    """Normalise one LRCLIB record to what the app needs."""
     synced = (found.get("syncedLyrics") or "").strip()
     plain = (found.get("plainLyrics") or "").strip() or (lrc_to_plain(synced) if synced else "")
     return {"synced": synced, "plain": plain,
@@ -945,8 +923,8 @@ def _lrclib_pick(found):
 
 
 def lookup_lyrics(artist, title, album, duration):
-    """Find lyrics for one track on LRCLIB. Returns a dict, or None if not found."""
-    # 1. Exact lookup: LRCLIB matches artist, title, album and length (±2 s).
+    """Find lyrics on LRCLIB. None if there aren't any."""
+    # 1. Exact match on artist, title, album and length.
     params = {"artist_name": artist, "track_name": title}
     if album:
         params["album_name"] = album
@@ -960,8 +938,8 @@ def lookup_lyrics(artist, title, album, duration):
     except urllib.error.HTTPError as e:
         if e.code != 404:
             raise
-    # 2. Search by artist and title (the album name may differ), and take the
-    #    closest length so a live or extended version isn't picked by mistake.
+    # 2. Search by artist and title, taking the closest length (avoids live or
+    #    extended versions).
     q = urllib.parse.urlencode({"artist_name": artist, "track_name": title})
     results = json.loads(http_get(f"{LRCLIB}/search?" + q))
     best, best_gap = None, None
@@ -995,7 +973,6 @@ class LyricsDialog(QDialog):
         self.found = {}   # row -> result dict
         self.state = {}   # row -> pending / found / instrumental / notfound / error / skipped
         self.note = {}    # row -> message shown for rows without lyrics
-        self.batch_total = 0
         self.batch_done = 0
         self.run_id = 1
         self.pool = ThreadPoolExecutor(max_workers=4)
@@ -1049,7 +1026,6 @@ class LyricsDialog(QDialog):
         split.setSizes([720, 320])
         lay.addWidget(split, 1)
 
-        # Outcome message + Try again
         msg_row = QHBoxLayout()
         self.summary = QLabel()
         self.summary.setWordWrap(True)
@@ -1095,7 +1071,7 @@ class LyricsDialog(QDialog):
         rows = list(rows)
         if not rows:
             return
-        self.batch_total, self.batch_done = len(rows), 0
+        self.batch_done = 0
         self.progress.setRange(0, len(rows))
         self.progress.setValue(0)
         self.progress.setFormat("Looking up %v of %m…")
@@ -1287,15 +1263,13 @@ def _friendly_error(e):
 
 
 # ---------------------------------------------------------------- audio formats
-# Every format is shown with the same tag names (TITLE, ARTIST, TRACKNUMBER, …),
-# the names FLAC uses. Each format below translates to and from its own tags.
-# Anything a format stores that Tagwell doesn't show (play counts, iTunes data,
-# ratings, …) is left exactly as it was when saving.
+# The app uses FLAC (Vorbis comment) tag names for every format. Each handler
+# translates to and from its own tags and leaves anything else untouched.
 
 AUDIO_EXTS = {".flac", ".mp3", ".m4a", ".m4b", ".mp4", ".ogg", ".oga", ".opus"}
 FORMAT_NAMES = {"flac": "FLAC", "mp3": "MP3", "mp4": "M4A", "ogg": "OGG", "opus": "Opus"}
 
-# Preferred display order for well-known tags (others follow, alphabetically).
+# Display order for MP3/M4A tags (others follow alphabetically).
 TAG_ORDER = ["TITLE", "ARTIST", "ALBUM", "ALBUMARTIST", "TRACKNUMBER", "TOTALTRACKS",
              "DISCNUMBER", "TOTALDISCS", "DATE", "GENRE", "COMPOSER", "PERFORMER",
              "CONDUCTOR", "LYRICIST", "COMMENT", "DESCRIPTION", "GROUPING", "BPM",
@@ -1319,7 +1293,7 @@ def _image_info(data):
     return (img.width(), img.height(), img.depth()) if not img.isNull() else (0, 0, 0)
 
 
-# ---- FLAC, OGG Vorbis, Opus (Vorbis comments: the same names Tagwell uses)
+# ---- FLAC, OGG Vorbis, Opus
 def _vc_read_pictures(tags):
     """Split out pictures stored as METADATA_BLOCK_PICTURE text tags."""
     kept, pics = [], []
@@ -1349,12 +1323,11 @@ class VorbisFormat:
         audio.tags.clear()
         audio.tags.extend(af.tags)
         if af.kind == "flac":
-            # FLAC has proper picture blocks
             audio.clear_pictures()
             for p in af.pics:
                 audio.add_picture(p.to_mutagen())
         else:
-            # OGG and Opus keep pictures in a text tag (the standard way)
+            # OGG and Opus keep pictures in a base64 text tag
             for p in af.pics:
                 audio.tags.append(("METADATA_BLOCK_PICTURE",
                                    base64.b64encode(p.to_mutagen().write()).decode("ascii")))
@@ -1372,8 +1345,7 @@ ID3_TEXT = {
     "TSOT": "TITLESORT", "TSO2": "ALBUMARTISTSORT", "TLAN": "LANGUAGE",
 }
 ID3_FROM_KEY = {v: k for k, v in ID3_TEXT.items()}
-# Frames that only exist in ID3v2.4. In a v2.3 file they are written as custom
-# (TXXX) tags instead, so nothing is lost.
+# ID3v2.4-only frames; written as TXXX in v2.3 files.
 ID3_V24_ONLY = {"TMOO", "TSOA", "TSOP", "TSOT", "TSST", "TPRO", "TDRL", "TDTG", "TDEN"}
 
 
@@ -1413,7 +1385,7 @@ class ID3Format:
                 pics.append(Pic(frame.type, frame.mime or "image/jpeg", frame.desc, w, h, d,
                                 bytes(frame.data)))
             else:
-                continue  # not managed by Tagwell: left exactly as it is
+                continue  # not managed here: left as is
             af._consumed.append(key)
         return _ordered(tags), pics
 
@@ -1427,8 +1399,7 @@ class ID3Format:
             id3.pop(key, None)
         grouped = {}
         for k, v in af.tags:
-            # MP3 (ID3) tags can't hold an empty value: the library drops them.
-            # A single space keeps a blank tag in the file and still looks blank.
+            # ID3 drops empty values, so a blank is stored as a single space.
             grouped.setdefault(k, []).append(v if v.strip() else " ")
 
         def pair(num_key, total_key):
@@ -1452,8 +1423,7 @@ class ID3Format:
             date_blank = (ID3_FROM_KEY.get(k) in ("TDRC", "TDOR")
                           and not any(v.strip() for v in values))
             if date_blank:
-                # MP3 date fields only accept real dates; keep a blank one as a
-                # custom tag (it moves to the date field once filled in)
+                # date frames only take real dates: keep a blank one as TXXX
                 frame = I.TXXX(encoding=3, desc=k, text=values)
             elif k in ID3_FROM_KEY and not (af._id3_version == 3
                                             and ID3_FROM_KEY[k] in ID3_V24_ONLY):
@@ -1540,7 +1510,7 @@ class MP4Format:
                     pics.append(Pic(FRONT_COVER if i == 0 else 0,
                                     "image/png" if png else "image/jpeg", "", w, h, d, bytes(c)))
             else:
-                continue  # not managed by Tagwell: left exactly as it is
+                continue  # not managed here: left as is
             af._consumed.append(key)
         return _ordered(tags), pics
 
@@ -1712,8 +1682,7 @@ class AudioFile:
         self._map(key, i, lambda k, v: (new, v))
 
     def copy(self, src, dst, replace):
-        """Copy this file's own value(s) of `src` into `dst`, exactly as they are.
-        Returns False if the file has no `src` tag (nothing is changed)."""
+        """Copy this file's `src` values into `dst`. False if it has no `src`."""
         values = self.values(src)
         if not values:
             return False
@@ -1728,6 +1697,29 @@ class AudioFile:
 
     def add(self, key, value):
         self.tags.append((key, value))
+        getattr(self, "deleted_keys", set()).discard(key)
+
+    def place(self, key, order):
+        """Move `key` next to its neighbours in `order`."""
+        if key not in order or not self.values(key):
+            return
+        mine = [kv for kv in self.tags if kv[0] == key]
+        rest = [kv for kv in self.tags if kv[0] != key]
+        at = order.index(key)
+        before = [k for k in order[:at] if any(kv[0] == k for kv in rest)]
+        after = [k for k in order[at + 1:] if any(kv[0] == k for kv in rest)]
+        if before:
+            pos = max(i for i, kv in enumerate(rest) if kv[0] == before[-1]) + 1
+        elif after:
+            pos = min(i for i, kv in enumerate(rest) if kv[0] == after[0])
+        else:
+            pos = 0
+        self.tags = rest[:pos] + mine + rest[pos:]
+
+    def reorder(self, keys):
+        """Sort tags by `keys`. A tag's values stay together; other tags go last."""
+        rank = {k: i for i, k in enumerate(keys)}
+        self.tags = sorted(self.tags, key=lambda kv: rank.get(kv[0], len(rank)))
 
     def save(self):
         self.fmt.write(self)
@@ -1735,13 +1727,39 @@ class AudioFile:
         self.original_pics = list(self.pics)
 
 
-FlacFile = AudioFile  # older name
 
 
 # ---------------------------------------------------------------- delegates
-class TagNameDelegate(QStyledItemDelegate):
-    """In-place editor for the Tag column: suggests known tag names, blocks
-    invalid characters and stores the name in uppercase."""
+class _OutlineSelection(QStyledItemDelegate):
+    """Draws the selected row as an outline, so coloured rows keep their colour."""
+
+    def paint(self, painter, option, index):
+        opt = QStyleOptionViewItem(option)
+        selected = bool(opt.state & QStyle.State_Selected)
+        opt.state &= ~(QStyle.State_Selected | QStyle.State_HasFocus)
+        super().paint(painter, opt, index)
+        if not selected:
+            return
+        last = index.model().columnCount() - 1
+        # the table's own highlight colour is transparent
+        col = QApplication.palette().color(QPalette.Active, QPalette.Highlight)
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        r = option.rect
+        pen = QPen(col, 2)
+        painter.setPen(pen)
+        top, bottom = r.top() + 1, r.bottom()
+        painter.drawLine(r.left(), top, r.right(), top)
+        painter.drawLine(r.left(), bottom, r.right(), bottom)
+        if index.column() == 0:
+            painter.drawLine(r.left() + 1, top, r.left() + 1, bottom)
+        if index.column() == last:
+            painter.drawLine(r.right(), top, r.right(), bottom)
+        painter.restore()
+
+
+class TagNameDelegate(_OutlineSelection):
+    """Tag column editor: suggests names, blocks invalid characters, uppercases."""
 
     def __init__(self, parent, names):
         super().__init__(parent)
@@ -1761,9 +1779,9 @@ class TagNameDelegate(QStyledItemDelegate):
             model.setData(index, name)
 
 
-class ValueDelegate(QStyledItemDelegate):
-    """Value column: a row whose value differs between files, or a preset tag
-    that's missing, starts empty, and leaving it empty changes nothing."""
+class ValueDelegate(_OutlineSelection):
+    """Value column editor. Mixed or missing rows start empty, and leaving them
+    empty changes nothing."""
 
     def _mixed(self, index):
         meta = index.sibling(index.row(), 0).data(META)
@@ -1797,7 +1815,7 @@ class PresetStore:
     def __init__(self, path=None):
         self.path = path or presets_path()
         if path is None and not os.path.exists(self.path):
-            # Presets saved before the app was renamed to Tagwell
+            # presets saved under the app's old name
             legacy = os.path.join(os.path.dirname(os.path.dirname(self.path)),
                                   "flac-tag-editor", "presets.json")
             if os.path.exists(legacy):
@@ -1905,8 +1923,7 @@ class PresetDialog(QDialog):
         self.accept()
 
 
-# ---------------------------------------------------------------- window
-VERSION = "1.1"
+VERSION = "1.2"
 
 # ---------------------------------------------------------------- look and feel
 APP_NAME = "Tagwell"
@@ -1978,8 +1995,7 @@ THEME = {}  # colours of the active theme, used by the style sheet and drawing c
 
 
 def apply_theme(app):
-    """Match the desktop: Plasma's colours, font and icons when available,
-    otherwise Breeze light or dark following the system preference."""
+    """Use Plasma's colours, font and icons, or Breeze light/dark."""
     app.setStyle("Fusion")
     kde = _read_kdeglobals() if os.environ.get("TAGWELL_IGNORE_KDE") != "1" else None
     dark_pref = False
@@ -1996,8 +2012,8 @@ def apply_theme(app):
     dark = _is_dark(c["window"])
     c["border"] = _mix(c["window"], c["text"], 0.16)
     c["dim"] = _mix(c["window"], c["text"], 0.55)
-    # Light: panels a touch brighter than the window. Dark: same as the window,
-    # so lists and text boxes read as darker wells (as Breeze Dark does).
+    # Light: panels slightly brighter than the window. Dark: same as the window,
+    # like Breeze Dark.
     c["panel"] = c["window"] if _is_dark(c["window"]) else _mix(c["window"], c["base"], 0.55)
     THEME.clear()
     THEME.update(c)
@@ -2038,8 +2054,8 @@ def apply_theme(app):
         if f.fromString(kde["font"]):
             app.setFont(f)
 
-    # Look for icon themes where Linux desktops keep them. (Without KDE's own Qt
-    # plugin, which an AppImage can't rely on, Qt only looks inside the app.)
+    # Without KDE's platform plugin (not in the AppImage) Qt only looks inside
+    # the app for icon themes.
     data_dirs = (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":")
     home_data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
     search = [os.path.join(home_data, "icons"), os.path.expanduser("~/.icons")]
@@ -2138,7 +2154,7 @@ _APP_ICON = None
 
 
 def _icon_file():
-    """tagwell.png next to the program (or inside the AppImage bundle)."""
+    """Path to tagwell.png (also inside the AppImage)."""
     places = [getattr(sys, "_MEIPASS", ""), os.path.dirname(os.path.abspath(__file__)),
               os.path.dirname(os.path.abspath(sys.executable))]
     for d in places:
@@ -2149,8 +2165,7 @@ def _icon_file():
 
 
 def make_app_icon():
-    """Tagwell's icon: the illustrated well (tagwell.png). Keep tagwell.png next
-    to tagwell.py; without it a simple drawn icon is used instead."""
+    """tagwell.png, or a drawn icon if it's missing."""
     global _APP_ICON
     if _APP_ICON is not None:
         return _APP_ICON
@@ -2348,8 +2363,7 @@ class AboutDialog(QDialog):
 
 
 class TagTable(QTableWidget):
-    """The tag list. Besides clicking (with Ctrl/Shift), tags can be selected by
-    dragging over them, including starting in the empty space below the list."""
+    """Tag list that can also be drag-selected, even from the empty space below."""
 
     def __init__(self, *a):
         super().__init__(*a)
@@ -2430,8 +2444,7 @@ def _flat_button(action, text_beside=True):
 
 
 def _mirror_button(action, text, icon_only=False):
-    """A flat button with its own short label that runs `action` and follows
-    whether it is enabled (menus keep the action's longer name)."""
+    """Flat button with its own label that triggers `action` and follows its enabled state."""
     b = QToolButton()
     b.setObjectName("flat")
     b.setAutoRaise(True)
@@ -2441,7 +2454,8 @@ def _mirror_button(action, text, icon_only=False):
     b.setToolButtonStyle(Qt.ToolButtonIconOnly if icon_only else Qt.ToolButtonTextBesideIcon)
     b.clicked.connect(action.trigger)
     b.setEnabled(action.isEnabled())
-    action.changed.connect(lambda: b.setEnabled(action.isEnabled()))
+    action.changed.connect(lambda: (b.setEnabled(action.isEnabled()),
+                                    b.setToolTip(action.toolTip())))
     return b
 
 
@@ -2458,6 +2472,25 @@ def _heading(text):
     l = QLabel(text)
     l.setObjectName("heading")
     return l
+
+
+ORDER_TINT_ALPHA = 55  # blue tint for preset tags out of the preset's order
+EXTRA_TINT_ALPHA = 45  # red tint for tags that aren't in the preset
+FILL_TINT_ALPHA = 60   # yellow tint for preset tags that need filling in
+NEEDS_FILL = Qt.UserRole + 20  # set on the value cell of a row that needs filling in
+
+
+def _blank(values):
+    return not any(v.strip() for v in values)
+
+
+def _longest_in_order(keys, preset):
+    """The most of `keys` already in preset order, so the fewest get marked blue."""
+    idx = [preset.index(k) for k in keys]
+    best = [[] for _ in idx]
+    for i, v in enumerate(idx):
+        best[i] = max((best[j] for j in range(i) if idx[j] < v), key=len, default=[]) + [i]
+    return [keys[i] for i in max(best, key=len, default=[])]
 
 
 class TagEditor(QMainWindow):
@@ -2561,9 +2594,19 @@ class TagEditor(QMainWindow):
         self.act_copy = A("Copy Tag To…", self.copy_selected, ("edit-copy",), None, None,
                           "Copy the selected tag into another tag. "
                           "Each file keeps its own value.")
-        self.act_remove_tag = A("Remove Tag", self.remove_selected_tags, ("edit-delete",),
+        self.act_remove_tag = A("Delete Tag", self.remove_selected_tags, ("edit-delete",),
                                 SP.SP_TrashIcon, None,
-                                "Remove the selected tag from the selected files (Delete)")
+                                "Delete the selected tags completely from the selected files "
+                                "(Delete)")
+        self.act_clear_value = A("Remove Value", self.clear_selected_values,
+                                 ("edit-clear", "edit-clear-all"), None, None,
+                                 "Empty the selected tags but keep them in the files")
+        self.act_move_up = A("Move Up", lambda: self.move_selected_tags(-1), ("go-up", "arrow-up"),
+                             SP.SP_ArrowUp, QKeySequence("Alt+Up"),
+                             "Move the selected tags up (Alt+Up)")
+        self.act_move_down = A("Move Down", lambda: self.move_selected_tags(1),
+                               ("go-down", "arrow-down"), SP.SP_ArrowDown,
+                               QKeySequence("Alt+Down"), "Move the selected tags down (Alt+Down)")
         self.act_delete_key = A("Delete", self._delete_key, (), None, QKeySequence.Delete)
         self.addAction(self.act_delete_key)
 
@@ -2590,22 +2633,42 @@ class TagEditor(QMainWindow):
                                  None, None, "Change the tags in the current preset")
         self.act_preset_delete = A("Delete Preset", self.delete_preset, ("edit-delete",),
                                    None, None, "Delete the current preset")
+        self.act_preset_update = A("Update Preset…", self.update_preset,
+                                   ("document-save", "document-edit"), None, None,
+                                   "Save the order of the tags shown now into the current "
+                                   "preset (you can also add the other tags shown)")
+        self.act_keep_extra = A("Keep Tag (Not in Preset)", self.keep_selected_tags,
+                                ("dialog-ok-apply", "checkmark"), None, None,
+                                "Keep the selected tag even though it isn't in the preset: "
+                                "it stops showing in red and won't be removed by the red button")
+        self.act_copy_value = A("Copy Value", self.copy_value, ("edit-copy",), None,
+                                QKeySequence.Copy, "Copy the selected tag's value (Ctrl+C)")
+        self.act_paste_value = A("Paste Value", self.paste_value, ("edit-paste",), None,
+                                 QKeySequence.Paste,
+                                 "Paste into the selected tags of the selected files (Ctrl+V)")
+        self.act_undo = A("Undo", self.undo, ("edit-undo",), None, QKeySequence.Undo,
+                          "Undo the last change (Ctrl+Z)")
+        self.act_redo = A("Redo", self.redo, ("edit-redo",), None, QKeySequence.Redo,
+                          "Redo what was undone (Ctrl+Shift+Z)")
+        self.act_preset_order = A("Use Preset Order", self.apply_preset_order,
+                                  ("view-sort-ascending", "view-sort", "sort-name"), None,
+                                  QKeySequence("Ctrl+R"),
+                                  "Put the tags of the selected files in the preset's order "
+                                  "(Ctrl+R). Select several files to do them all at once.")
         self.act_about = A(f"About {APP_NAME}", self.show_about, ("help-about",),
                            SP.SP_MessageBoxInformation)
-        self.act_about_qt = A("About Qt", lambda: QMessageBox.aboutQt(self))
 
-        # Older code switches these on and off by these names
-        self.rename_btn, self.copy_btn = self.act_rename, self.act_copy
-        self.remove_btn, self.lyrics_btn = self.act_remove_tag, self.act_lyrics
         self.cover_import_btn, self.cover_export_btn = self.act_import_pic, self.act_export_pic
         self.cover_remove_btn, self.cover_find_btn = self.act_remove_pic, self.act_find_cover
         self.preset_edit_btn = self.act_preset_edit
         self.preset_delete_btn = self.act_preset_delete
 
     def _build_shortcuts(self):
-        """No menu bar: keyboard shortcuts are attached to the window itself."""
+        """Window shortcuts (there's no menu bar)."""
         for a in (self.act_add_files, self.act_add_folder, self.act_save, self.act_quit,
-                  self.act_add_tag, self.act_rename):
+                  self.act_add_tag, self.act_rename, self.act_move_up, self.act_move_down,
+                  self.act_undo, self.act_redo, self.act_copy_value, self.act_paste_value,
+                  self.act_preset_order):
             a.setShortcutContext(Qt.WindowShortcut)
             self.addAction(a)
 
@@ -2672,16 +2735,113 @@ class TagEditor(QMainWindow):
             "Pick a preset to show any of its tags a file is missing, ready to fill in")
         self.preset_combo.currentTextChanged.connect(self._preset_chosen)
         pr.addWidget(self.preset_combo, 1)
-        for a, label in ((self.act_preset_new, "New…"), (self.act_preset_edit, "Edit…"),
-                         (self.act_preset_delete, "Delete")):
+        notes = []
+        self.order_note = QPushButton("Not in preset order")
+        self.order_note.setObjectName("orderNote")
+        self.order_note.setCursor(Qt.PointingHandCursor)
+        self.order_note.setAutoDefault(False)
+        self.order_note.setStyleSheet(
+            # same blue as the out-of-order rows
+            "QPushButton#orderNote { color: palette(text); border: none; "
+            f"background: rgba(52, 120, 210, {ORDER_TINT_ALPHA}); "
+            "border-radius: 7px; padding: 2px 9px; font-size: 8pt; font-weight: 600; }"
+            "QPushButton#orderNote:hover { background: rgba(52, 120, 210, 100); }")
+        self.order_note.setToolTip("Some tags aren't in the preset's order (shown in blue). "
+                                   "Click to put the selected files' tags in the preset's "
+                                   "order (or press Ctrl+R).")
+        self.order_note.clicked.connect(self.apply_preset_order)
+        self.order_note.hide()
+        notes.append(self.order_note)
+        self.extra_note = QPushButton("Not in preset")
+        self.extra_note.setObjectName("extraNote")
+        self.extra_note.setCursor(Qt.PointingHandCursor)
+        self.extra_note.setAutoDefault(False)
+        self.extra_note.setStyleSheet(
+            # same red as the rows not in the preset
+            "QPushButton#extraNote { color: palette(text); border: none; "
+            f"background: rgba(230, 60, 60, {EXTRA_TINT_ALPHA}); "
+            "border-radius: 7px; padding: 2px 9px; font-size: 8pt; font-weight: 600; }"
+            "QPushButton#extraNote:hover { background: rgba(230, 60, 60, 95); }")
+        self.extra_note.clicked.connect(self.remove_extra_tags)
+        self.extra_note.hide()
+        notes.append(self.extra_note)
+        self.fill_note = QPushButton("To fill in")
+        self.fill_note.setObjectName("fillNote")
+        self.fill_note.setCursor(Qt.PointingHandCursor)
+        self.fill_note.setAutoDefault(False)
+        self.fill_note.setStyleSheet(
+            # same yellow as the rows to fill in
+            "QPushButton#fillNote { color: palette(text); border: none; "
+            f"background: rgba(255, 196, 0, {FILL_TINT_ALPHA}); "
+            "border-radius: 7px; padding: 2px 9px; font-size: 8pt; font-weight: 600; }"
+            "QPushButton#fillNote:hover { background: rgba(255, 196, 0, 130); }")
+        self.fill_note.setToolTip("Preset tags with nothing in them yet (shown in yellow). "
+                                  "Click to start typing in the first one; press Enter to "
+                                  "go on to the next.")
+        self.fill_note.clicked.connect(lambda: self.fill_next(-1))
+        self.fill_note.hide()
+        notes.append(self.fill_note)
+        self.fixed_note = QLabel("MP3/M4A: fixed tag order")
+        self.fixed_note.setObjectName("dim")
+        self.fixed_note.setToolTip(
+            "MP3 and M4A files always store their tags in a set order of their own, so "
+            "their tags can't be moved and the preset's order can't be applied to them. "
+            "Tag order can be changed in FLAC, OGG and Opus files.")
+        self.fixed_note.hide()
+        notes.append(self.fixed_note)
+        pr.addSpacing(6)
+        for a, label in ((self.act_preset_update, "Update…"), (self.act_preset_new, "New…"),
+                         (self.act_preset_edit, "Edit…"), (self.act_preset_delete, "Delete")):
             pr.addWidget(_mirror_button(a, label))
+        backup = QToolButton()
+        backup.setObjectName("flat")
+        backup.setIcon(icon("application-menu", "overflow-menu", "open-menu-symbolic",
+                            fallback=QStyle.SP_ToolBarHorizontalExtensionButton))
+        backup.setToolTip("Export or import presets, e.g. to back them up or move them "
+                          "to another computer")
+        backup.setPopupMode(QToolButton.InstantPopup)
+        menu = QMenu(backup)
+        menu.addAction(icon("document-export", "document-save-as"), "Export Presets…",
+                       self.export_presets)
+        menu.addAction(icon("document-import", "document-open"), "Import Presets…",
+                       self.import_presets)
+        backup.setMenu(menu)
+        pr.addWidget(backup)
         lay.addWidget(self.preset_bar)
+        # Preset check buttons, shown only when there's something to fix
+        self.notes_bar = QWidget()
+        nl = QHBoxLayout(self.notes_bar)
+        nl.setContentsMargins(0, 0, 0, 0)
+        nl.setSpacing(6)
+        for wdg in (notes[2], notes[1], notes[0], notes[3]):  # fill, extra, order, fixed
+            nl.addWidget(wdg)
+        self.notes_help = QToolButton()
+        self.notes_help.setIcon(icon("help-about", "help-contextual", "dialog-information",
+                                     fallback=QStyle.SP_MessageBoxQuestion))
+        self.notes_help.setText("More info")
+        self.notes_help.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.notes_help.setAutoRaise(True)
+        self.notes_help.setCursor(Qt.PointingHandCursor)
+        self.notes_help.setToolTip("What these buttons mean, how the preset check works, "
+                                   "and why MP3/M4A tags can't be moved")
+        self.notes_help.clicked.connect(self.explain_colours)
+        nl.addWidget(self.notes_help)
+        nl.addStretch(1)
+        self.notes_bar.hide()
+        lay.addWidget(self.notes_bar)
 
         self.tag_stack = QStackedWidget()
         self.tag_stack.addWidget(self._build_empty_state())
 
         self.table = TagTable(0, 2)
         self.table.setObjectName("inpanel")
+        self.table.itemSelectionChanged.connect(lambda: self._update_keep_action())
+        # The selection is drawn as an outline (_OutlineSelection), not filled
+        tp = self.table.palette()
+        for group in (QPalette.Active, QPalette.Inactive):
+            tp.setColor(group, QPalette.Highlight, QColor(0, 0, 0, 0))
+            tp.setColor(group, QPalette.HighlightedText, tp.color(group, QPalette.Text))
+        self.table.setPalette(tp)
         self.table.setHorizontalHeaderLabels(["Tag", "Value"])
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -2701,7 +2861,15 @@ class TagEditor(QMainWindow):
         self.table.itemChanged.connect(self._item_changed)
         self.table.cellDoubleClicked.connect(self._cell_double_clicked)
         self.table.setContextMenuPolicy(Qt.ActionsContextMenu)
-        for a in (self.act_rename, self.act_copy, self.act_remove_tag):
+        sep, sep2 = QAction(self), QAction(self)
+        sep.setSeparator(True)
+        sep2.setSeparator(True)
+        sep3 = QAction(self)
+        sep3.setSeparator(True)
+        for a in (self.act_undo, self.act_redo, sep2, self.act_copy_value, self.act_paste_value,
+                  sep3, self.act_rename, self.act_copy,
+                  self.act_clear_value, self.act_remove_tag, self.act_move_up,
+                  self.act_move_down, sep, self.act_keep_extra):
             self.table.addAction(a)
         self.tag_stack.addWidget(self.table)
         lay.addWidget(self.tag_stack, 1)
@@ -2732,8 +2900,14 @@ class TagEditor(QMainWindow):
         btns = QHBoxLayout()
         btns.setSpacing(2)
         for a, label in ((self.act_rename, "Rename…"), (self.act_copy, "Copy To…"),
-                         (self.act_remove_tag, "Remove")):
+                         (self.act_clear_value, "Remove Value"), (self.act_remove_tag, "Delete")):
             btns.addWidget(_mirror_button(a, label))
+        btns.addSpacing(4)
+        btns.addWidget(_mirror_button(self.act_undo, "Undo", icon_only=True))
+        btns.addWidget(_mirror_button(self.act_redo, "Redo", icon_only=True))
+        btns.addSpacing(4)
+        btns.addWidget(_mirror_button(self.act_move_up, "Move Up", icon_only=True))
+        btns.addWidget(_mirror_button(self.act_move_down, "Move Down", icon_only=True))
         btns.addSpacing(8)
         btns.addWidget(_mirror_button(self.act_lyrics, "Lyrics…"))
         btns.addStretch(1)
@@ -2783,7 +2957,6 @@ class TagEditor(QMainWindow):
         head = QHBoxLayout()
         head.addWidget(_heading("Picture"))
         head.addStretch(1)
-        lay_btns = QHBoxLayout()
         self.cover_prev = QToolButton()
         self.cover_prev.setObjectName("flat")
         self.cover_prev.setIcon(icon("go-previous", fallback=QStyle.SP_ArrowLeft))
@@ -2805,7 +2978,8 @@ class TagEditor(QMainWindow):
         self.cover_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.cover_label.setWordWrap(True)
         self.cover_label.setToolTip("Double-click to view full size.\n"
-                                    "Drop a picture here from a folder or your web browser to import it.")
+                                    "Drop a picture here from a folder or your web browser "
+                                    "to import it.")
         self.cover_label.installEventFilter(self)
         v.addWidget(self.cover_label, 1)
 
@@ -2874,7 +3048,7 @@ class TagEditor(QMainWindow):
         self.refresh_table()
 
     def _shown_pics(self):
-        """(pictures shared by every selected file, or None if they differ)."""
+        """Pictures shared by every selected file, or None if they differ."""
         files = self.selected_files()
         if not files:
             return None
@@ -3037,7 +3211,7 @@ class TagEditor(QMainWindow):
             + (f" ({note})" if note else ""))
 
     def _common_value(self, files, *keys):
-        """The first of `keys` the files have, using the most common value."""
+        """The first of `keys` the files have, using its most common value."""
         for key in keys:
             counts = {}
             for f in files:
@@ -3179,9 +3353,7 @@ class TagEditor(QMainWindow):
         self._update_labels()
 
     def _rebuild_file_list(self):
-        """Keep the list in folder/name order (track 2 before track 10), and keep
-        what's selected. If the app picked the selection itself (nobody has
-        clicked a file yet), move it to the first file in the list."""
+        """Sort the list by folder and name, keeping the selection."""
         selected = set(map(id, self.selected_files()))
         self.files.sort(key=lambda f: natural_key(f.path))
         auto = self._auto_selected or not selected
@@ -3247,8 +3419,7 @@ class TagEditor(QMainWindow):
         self._update_labels()
 
     def known_tags(self, exclude=()):
-        """Tag names to offer in lists: every tag used in the loaded files
-        (including custom ones), then the common names not already there."""
+        """Tags in the loaded files and presets, then the common ones."""
         used = sorted({k for f in self.files for k, _ in f.tags} |
                       {t for tags in self.store.presets.values() for t in tags})
         names = used + [t for t in COMMON_TAGS if t not in used]
@@ -3267,17 +3438,17 @@ class TagEditor(QMainWindow):
         return [self.files[r] for r in rows]
 
     def _handle_blank_tags(self):
-        """Before saving, ask what to do with blank tags: ones added with no value,
-        and preset tags left unfilled. Returns False if the user cancelled."""
+        """Ask whether to save blank tags. False if cancelled."""
         dirty = [f for f in self.files if f.dirty]
         selected = self.selected_files()
         # Preset tags still missing: from the files being saved and the files shown
         targets = list(dict.fromkeys(dirty + selected))
         preset = self.active_preset_tags()
-        missing = {f: [k for k in preset if not f.values(k)] for f in targets}
+        shown_order = self._shown_keys()
+        missing = {f: [k for k in preset if not f.values(k)
+                       and k not in getattr(f, "deleted_keys", ())] for f in targets}
         missing = {f: ks for f, ks in missing.items() if ks}
-        # Tags in the files being saved that have no value. Blank tags already
-        # saved in the file earlier (kept on purpose) aren't asked about again.
+        # Tags with no value. Blanks already saved in the file are left alone.
         blank = {f: [k for k, v in f.tags if not v.strip() and (k, v) not in f.original]
                  for f in dirty}
         blank = {f: ks for f, ks in blank.items() if ks}
@@ -3314,6 +3485,7 @@ class TagEditor(QMainWindow):
             for f, ks in missing.items():
                 for k in ks:
                     f.add(k, "")
+                    f.place(k, shown_order if f in selected else preset)
         elif clicked == drop:
             for f in blank:
                 f.tags = [(k, v) for k, v in f.tags if v.strip() or (k, v) in f.original]
@@ -3355,18 +3527,31 @@ class TagEditor(QMainWindow):
             for k, _ in f.tags:
                 if k not in keys:
                     keys.append(k)
-        # With a preset in use, its tags come first in its order, including
-        # ones none of the selected files have yet.
+        # Show the files' own order; missing preset tags go next to their preset
+        # neighbours.
         preset = self.active_preset_tags() if files else []
-        keys = preset + [k for k in keys if k not in preset]
+        for i, k in enumerate(preset):
+            if k in keys:
+                continue
+            prev = next((p for p in reversed(preset[:i]) if p in keys), None)
+            nxt = next((p for p in preset[i + 1:] if p in keys), None)
+            keys.insert(keys.index(prev) + 1 if prev else keys.index(nxt) if nxt else 0, k)
+        # keep the order from Move Up / Move Down for this selection
+        moved = getattr(self, "_moved_order", None)
+        if moved and moved[0] == self._selection_id(files):
+            keys = [k for k in moved[1] if k in keys] + [k for k in keys if k not in moved[1]]
         for key in keys:
             lists = [f.values(key) for f in files]
             if not any(lists):
+                if all(key in getattr(f, "deleted_keys", ()) for f in files):
+                    continue  # deleted on purpose: don't offer it to fill in again
                 self._append_missing_row(key)
             elif all(l == lists[0] for l in lists):
                 # Same in every selected file: one row per value
                 for i, v in enumerate(lists[0]):
-                    self._append_row(key, v, ("same", key, i))
+                    row = self._append_row(key, v, ("same", key, i))
+                    if key in preset and not v.strip():
+                        self._mark_fill(row, f"{key} is in the preset but empty")
             else:
                 row = self._append_row(key, MIXED_TEXT, ("mixed", key))
                 cell = self.table.item(row, 1)
@@ -3379,17 +3564,85 @@ class TagEditor(QMainWindow):
                 if len(files) > 25:
                     lines.append("…")
                 cell.setToolTip("\n".join(lines))
-                lacking = sum(1 for l in lists if not l)
+                lacking = sum(1 for l in lists if _blank(l))
                 if key in preset and lacking:
-                    tint = QColor(255, 196, 0, 60)
-                    for c in (0, 1):
-                        self.table.item(row, c).setBackground(tint)
+                    self._mark_fill(row)
                     cell.setText(f"<missing in {lacking} of {len(files)} files>")
                     cell.setToolTip(cell.toolTip() +
                                     "\n\nType a value to set it in all selected files")
+        # tags not in the preset: red
+        extra = 0
+        if preset:
+            tint = QColor(230, 60, 60, EXTRA_TINT_ALPHA)
+            note = f"Not in the preset “{self.store.active}”"
+            for r in range(self.table.rowCount()):
+                key = self._row_meta(r)[1]
+                if self._is_extra(key, files, preset):
+                    extra += 1
+                    for c in (0, 1):
+                        it = self.table.item(r, c)
+                        it.setBackground(tint)
+                        tip = it.toolTip()
+                        it.setToolTip(note + ("\n\n" + tip if tip else ""))
+                elif key not in preset:
+                    # kept with Keep Tag: italic, not red
+                    it = self.table.item(r, 0)
+                    font = QFont(it.font())
+                    font.setItalic(True)
+                    it.setFont(font)
+                    it.setToolTip("Kept, although it isn't in the preset "
+                                  f"“{self.store.active}”."
+                                  "\nRight-click → Don't Keep Tag to change your mind.")
+        # preset tags out of the preset's order: blue
+        out_of_order = False
+        sortable = [f for f in files if f.kind not in ("mp3", "mp4")]
+        if preset and sortable:
+            shown = []
+            for r in range(self.table.rowCount()):
+                k = self._row_meta(r)[1]
+                if k in preset and k not in shown:
+                    shown.append(k)
+            keep = set(_longest_in_order(shown, preset))
+            tint = QColor(52, 120, 210, ORDER_TINT_ALPHA)
+            for r in range(self.table.rowCount()):
+                k = self._row_meta(r)[1]
+                if k in preset and k not in keep and not self.table.item(r, 1).data(NEEDS_FILL):
+                    pos = preset.index(k)
+                    after = preset[pos - 1] if pos else None
+                    note = ("Out of the preset's order: it comes "
+                            + (f"after {after}" if after else "first")
+                            + " in the preset. Click “Not in preset order” "
+                            "(or press Ctrl+R) to fix.")
+                    for c in (0, 1):
+                        it = self.table.item(r, c)
+                        it.setBackground(tint)
+                        tip = it.toolTip()
+                        it.setToolTip(note + ("\n\n" + tip if tip else ""))
+            # only the preset's own tags count here
+            def preset_keys(f):
+                return list(dict.fromkeys(k for k, _ in f.tags if k in preset))
+            out_of_order = any(preset_keys(f) != [k for k in preset if k in preset_keys(f)]
+                               for f in sortable)
+        self.order_note.setVisible(out_of_order)
+        self.fixed_note.setVisible(any(f.kind in ("mp3", "mp4") for f in files))
+        self._update_notes_bar()
         self.table.blockSignals(False)
         if self.table.rowCount():
             self.table.setCurrentCell(min(max(current, 0), self.table.rowCount() - 1), 0)
+        self._update_keep_action()
+        extra_keys = {self._row_meta(r)[1] for r in range(self.table.rowCount())
+                      if preset and self._is_extra(self._row_meta(r)[1], files, preset)}
+        n = len(extra_keys)
+        self.extra_note.setText(f"{n} tag{'s' if n != 1 else ''} not in preset")
+        self.extra_note.setToolTip(
+            "These tags (shown in red) aren't part of the preset. Click to remove them "
+            "from the selected files. To keep one, right-click it and choose Keep Tag "
+            "first.")
+        self.extra_note.setVisible(bool(n))
+        to_fill = len(self._fill_rows())
+        self.fill_note.setText(f"{to_fill} to fill in")
+        self.fill_note.setVisible(bool(to_fill))
+        self._update_notes_bar()
         self.refresh_cover()
 
         n = len(files)
@@ -3421,26 +3674,110 @@ class TagEditor(QMainWindow):
                 "files; hover to see each file's value.")
             self.info_label.setToolTip("")
         for w in (self.tag_combo, self.value_edit, self.add_btn, self.act_add_tag,
-                  self.rename_btn, self.copy_btn, self.remove_btn, self.lyrics_btn):
+                  self.act_rename, self.act_copy, self.act_remove_tag, self.act_lyrics):
             w.setEnabled(n > 0)
         has_row = n > 0 and self.table.rowCount() > 0
-        for a in (self.act_rename, self.act_copy, self.act_remove_tag):
+        for a in (self.act_rename, self.act_copy, self.act_remove_tag, self.act_clear_value):
             a.setEnabled(has_row)
+        # MP3 and M4A keep a fixed tag order
+        movable = has_row and any(f.kind not in ("mp3", "mp4") for f in files)
+        for a, what in ((self.act_move_up, "up"), (self.act_move_down, "down")):
+            a.setEnabled(movable)
+            a.setToolTip(f"Move the selected tags {what} (Alt+{what.title()})"
+                         if movable or not has_row
+                         else "MP3 and M4A files keep their tags in a fixed order, "
+                              "so they can't be moved")
         if hasattr(self, "summary_label"):
             self._update_labels()
 
     def _append_missing_row(self, key):
-        """A preset tag that none of the selected files has: an empty,
-        highlighted row. Nothing is written unless a value is typed in."""
+        """Empty row for a preset tag that none of the selected files have."""
         row = self._append_row(key, "", ("missing", key))
         name = self.table.item(row, 0)
         name.setFlags(name.flags() & ~Qt.ItemIsEditable)
-        tint = QColor(255, 196, 0, 60)
-        for c in (0, 1):
-            self.table.item(row, c).setBackground(tint)
+        self._mark_fill(row)
         name.setToolTip(f"{key} is in the preset but not in this file yet")
         self.table.item(row, 1).setToolTip("Double-click to fill in")
         return row
+
+    def explain_colours(self):
+        def chip(rgba, text):
+            return (f'<span style="background-color: rgba({rgba}); padding: 2px 8px;">'
+                    f'&nbsp;<b>{text}</b>&nbsp;</span>')
+        yellow = f"255, 196, 0, {FILL_TINT_ALPHA * 2}"
+        red = f"230, 60, 60, {EXTRA_TINT_ALPHA * 2}"
+        blue = f"52, 120, 210, {ORDER_TINT_ALPHA * 2}"
+        name = self.store.active
+        intro = (f"""<p>With a preset chosen (now: <b>{name}</b>), Tagwell checks the selected
+songs against it and colours the tags that need a look. Click a coloured button to sort
+them out. Nothing is written to the files until you press <b>Save</b>, and you
+can press <b>Ctrl+Z</b> to undo it.</p>""" if name else """<p>No preset is chosen, so the songs
+aren't being checked. Pick a preset from the <b>Preset</b> list and Tagwell will colour
+the tags that need a look, as below.</p>""")
+        html = intro + f"""
+<table cellspacing="0" cellpadding="6">
+<tr><td>{chip(yellow, "To fill in")}</td><td>A tag in the preset that the song doesn't have
+yet, or that's empty. <b>Click the button</b> to start typing in the first one; press
+<b>Enter</b> to go on to the next.</td></tr>
+<tr><td>{chip(red, "Not in preset")}</td><td>A tag that isn't part of the preset.
+<b>Click the button</b> to remove them all. To keep one, right-click it and choose
+<b>Keep Tag</b> (its name turns <i>italic</i>). To add them to the preset instead,
+use <b>Update… → Save and Add Tags</b>.</td></tr>
+<tr><td>{chip(blue, "Not in preset order")}</td><td>A preset tag that's in a different
+place from the preset's order. <b>Click the button</b> (or press <b>Ctrl+R</b>) to put
+the tags in the preset's order. To make the order you have now the preset's order,
+use <b>Update… → Save</b>.</td></tr>
+</table>
+<p>The tag you've selected has an outline around it.</p>
+<p><b>MP3 and M4A files</b> always keep their tags in a set order of their own, so
+tags can only be moved (and put in the preset's order) in FLAC, OGG and Opus files.</p>
+"""
+        box = QMessageBox(self)
+        box.setWindowTitle("Preset check and tag order")
+        box.setIcon(QMessageBox.Information)
+        box.setTextFormat(Qt.RichText)
+        box.setText(html)
+        box.exec()
+
+    def _update_notes_bar(self):
+        if hasattr(self, "notes_bar"):
+            self.notes_bar.setVisible(bool(self.selected_files()) and any(
+                not w.isHidden() for w in (self.order_note, self.extra_note,
+                                           self.fill_note, self.fixed_note)))
+
+    def _mark_fill(self, row, tip=None):
+        """Mark a row as needing filling in (yellow)."""
+        tint = QColor(255, 196, 0, FILL_TINT_ALPHA)
+        for c in (0, 1):
+            self.table.item(row, c).setBackground(tint)
+        self.table.item(row, 1).setData(NEEDS_FILL, True)
+        if tip:
+            self.table.item(row, 0).setToolTip(tip)
+            self.table.item(row, 1).setToolTip("Double-click to fill in")
+
+    def _fill_rows(self):
+        return [r for r in range(self.table.rowCount())
+                if self.table.item(r, 1) and self.table.item(r, 1).data(NEEDS_FILL)]
+
+    def fill_next(self, after_row=None):
+        """Edit the next yellow row after the current one; Enter moves on."""
+        rows = self._fill_rows()
+        if not rows:
+            self._filling_key = None
+            self.statusBar().showMessage("Every tag in the preset is filled in", 5000)
+            return
+        cur = self.table.currentRow() if after_row is None else after_row
+        r = next((x for x in rows if x > cur), rows[0])
+        self._filling_key = self._row_meta(r)[1]
+        self.table.clearSelection()
+        self.table.setCurrentCell(r, 1)
+        self.table.scrollToItem(self.table.item(r, 1))
+        self.table.setFocus()
+        self.table.editItem(self.table.item(r, 1))
+        left = len(rows)
+        self.statusBar().showMessage(
+            f"Type the {self._filling_key} and press Enter to go on to the next "
+            f"({left} to fill in). Esc stops.", 6000)
 
     def _append_row(self, key, value, meta):
         row = self.table.rowCount()
@@ -3491,16 +3828,21 @@ class TagEditor(QMainWindow):
         i = meta[2] if kind == "same" else None
         files = self.selected_files()
         text = item.text()
+        filling = (item.column() == 1 and getattr(self, "_filling_key", None) == key
+                   and text.strip() != "")
+
         if item.column() == 1:
             if kind == "missing":
                 if text == "":
                     return
+                order = self._shown_keys()
                 for f in files:
                     f.add(key, text)
+                    f.place(key, order)
             elif kind == "mixed":
                 if text in ("", MIXED_TEXT) or text.startswith("<missing in "):
                     return
-                lacking = [f for f in files if not f.values(key)]
+                lacking = [f for f in files if _blank(f.values(key))]
                 targets = files
                 if lacking and key in self.active_preset_tags():
                     box = QMessageBox(self)
@@ -3521,8 +3863,12 @@ class TagEditor(QMainWindow):
                         return
                     if box.clickedButton() == only:
                         targets = lacking
+                order = self._shown_keys()
                 for f in targets:
+                    had = bool(f.values(key))
                     f.replace_all(key, text)
+                    if not had:
+                        f.place(key, order)
             else:
                 for f in files:
                     f.set_value(key, i, text)
@@ -3531,11 +3877,28 @@ class TagEditor(QMainWindow):
                 return
             for f in files:
                 f.rename(key, text, i)
+        if filling:
+            self._continue_fill = item.row()  # go on to the next one after this
         self._after_edit()
+
+    def _shown_keys(self):
+        keys = []
+        for r in range(self.table.rowCount()):
+            k = self._row_meta(r)[1]
+            if k not in keys:
+                keys.append(k)
+        return keys
 
     def _after_edit(self):
         # Rebuild after Qt has finished closing the cell editor.
-        QTimer.singleShot(0, lambda: (self.refresh_table(), self._update_labels()))
+        def done():
+            self.refresh_table()
+            self._update_labels()
+            r = getattr(self, "_continue_fill", None)
+            if r is not None:
+                self._continue_fill = None
+                self.fill_next(r - 1)
+        QTimer.singleShot(0, done)
 
     def add_tag(self):
         files = self.selected_files()
@@ -3553,7 +3916,6 @@ class TagEditor(QMainWindow):
         self.value_edit.clear()
         self.refresh_table()
         self._update_labels()
-        # Select the row that was just added
         for r in range(self.table.rowCount() - 1, -1, -1):
             if self.table.item(r, 0).text() == name:
                 self.table.setCurrentCell(r, 1)
@@ -3679,10 +4041,259 @@ class TagEditor(QMainWindow):
         self.statusBar().showMessage(
             f"Lyrics added to {n} file{'s' if n != 1 else ''} — not saved yet", 8000)
 
-    def remove_selected_tags(self):
+    def _selection_id(self, files):
+        return (tuple(id(f) for f in files), self.store.active)
+
+    def move_selected_tags(self, step):
+        """Move the selected tags up (-1) or down (+1)."""
         files = self.selected_files()
-        rows = {i.row() for i in self.table.selectedIndexes()}
+        rows = sorted({i.row() for i in self.table.selectedIndexes()}) or (
+            [self.table.currentRow()] if self.table.currentRow() >= 0 else [])
+        if not files or not rows:
+            return
+        order = []
+        for r in range(self.table.rowCount()):
+            k = self._row_meta(r)[1]
+            if k not in order:
+                order.append(k)
+        chosen = {self._row_meta(r)[1] for r in rows}
+        new = list(order)
+        idx = range(1, len(new)) if step < 0 else range(len(new) - 2, -1, -1)
+        for i in idx:
+            j = i + step
+            if new[i] in chosen and new[j] not in chosen:
+                new[i], new[j] = new[j], new[i]
+        if new == order:
+            return
+        self._moved_order = (self._selection_id(files), new)
+        for f in files:
+            f.reorder(new)
+        self.refresh_table()
+        # keep the moved tags selected
+        self.table.clearSelection()
+        mode = self.table.selectionMode()
+        self.table.setSelectionMode(QAbstractItemView.MultiSelection)
+        first = None
+        for r in range(self.table.rowCount()):
+            if self._row_meta(r)[1] in chosen:
+                self.table.selectRow(r)
+                first = r if first is None else first
+        self.table.setSelectionMode(mode)
+        if first is not None:
+            self.table.setCurrentCell(first, 0, QItemSelectionModel.NoUpdate)
+            self.table.scrollToItem(self.table.item(first, 0))
+        self._update_labels()
+        fixed = sorted({f.format_name for f in files if f.kind in ("mp3", "mp4")})
+        if fixed:
+            self.statusBar().showMessage(
+                f"Note: {' and '.join(fixed)} files keep their tags in a set order of their "
+                "own, so a new order is only kept in FLAC, OGG and Opus files.", 8000)
+
+    def _is_extra(self, key, files, preset):
+        """Not in the preset and not kept with Keep Tag."""
+        return key not in preset and not (
+            files and all(key in getattr(f, "kept_keys", ()) for f in files))
+
+    def _keep_state(self):
+        """(selected tags not in the preset, whether they're all kept)"""
+        preset = self.active_preset_tags()
+        files = self.selected_files()
+        if not preset or not files:
+            return set(), False
+        keys = {self._row_meta(r)[1] for r in self._chosen_rows()} - set(preset)
+        kept = bool(keys) and all(k in getattr(f, "kept_keys", ()) for k in keys for f in files)
+        return keys, kept
+
+    def _update_keep_action(self):
+        keys, kept = self._keep_state()
+        self.act_keep_extra.setEnabled(bool(keys))
+        self.act_keep_extra.setText("Don't Keep Tag" if kept else "Keep Tag (Not in Preset)")
+        self.act_keep_extra.setToolTip(
+            "Mark the tag as not in the preset again (red), so the red button removes it"
+            if kept else
+            "Keep the selected tag even though it isn't in the preset: it stops showing in "
+            "red and won't be removed by the red button")
+
+    def keep_selected_tags(self):
+        """Toggle Keep Tag for the selected tags."""
+        files = self.selected_files()
+        keys, kept = self._keep_state()
+        if not keys:
+            self.statusBar().showMessage("Select a tag that isn't in the preset first", 5000)
+            return
+        for f in files:
+            if not hasattr(f, "kept_keys"):
+                f.kept_keys = set()
+            if kept:
+                f.kept_keys -= keys
+            else:
+                f.kept_keys |= keys
+        self.refresh_table()
+        self._update_labels()
+        names = ", ".join(sorted(keys))
+        self.statusBar().showMessage(
+            f"{names} no longer kept — shown as not in the preset again" if kept else
+            f"Keeping {names} — no longer marked as not in the preset", 6000)
+
+    def remove_extra_tags(self):
+        """Remove the tags that aren't in the preset (asks first)."""
+        preset = self.active_preset_tags()
+        files = self.selected_files()
+        if not preset or not files:
+            return
+        keys = []
+        for r in range(self.table.rowCount()):
+            k = self._row_meta(r)[1]
+            if self._is_extra(k, files, preset) and k not in keys:
+                keys.append(k)
+        if not keys:
+            return
+        n = len(files)
+        box = QMessageBox(self)
+        box.setWindowTitle("Remove tags")
+        box.setIcon(QMessageBox.Question)
+        box.setText(f"Remove the {len(keys)} tag{'s' if len(keys) != 1 else ''} that "
+                    f"aren't in the preset “{self.store.active}”"
+                    + (f" from all {n} selected files?" if n > 1 else "?"))
+        box.setInformativeText(", ".join(keys) +
+                               "\n\nThey're only taken out of the files when you save.")
+        remove = box.addButton("Remove", QMessageBox.DestructiveRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(remove)
+        box.exec()
+        if box.clickedButton() is not remove:
+            return
+        for f in files:
+            for k in keys:
+                f.remove(k)
+        self.refresh_table()
+        self._update_labels()
+        self.statusBar().showMessage(
+            f"Removed {len(keys)} tag{'s' if len(keys) != 1 else ''} not in the preset "
+            "— not saved yet", 8000)
+
+    def _chosen_rows(self):
+        return sorted({i.row() for i in self.table.selectedIndexes()} or (
+            {self.table.currentRow()} if self.table.currentRow() >= 0 else set()))
+
+    def copy_value(self):
+        files = self.selected_files()
+        rows = self._chosen_rows()
+        if not files or not rows:
+            return
+        kind, key = self._row_meta(rows[0])[:2]
+        if kind == "same":
+            text = files[0].values(key)[self._row_meta(rows[0])[2]]
+        elif kind == "mixed":
+            self.statusBar().showMessage(
+                f"{key} is different in each selected file. Select just one file to copy "
+                "its value.", 6000)
+            return
+        else:
+            self.statusBar().showMessage(f"{key} has no value to copy", 4000)
+            return
+        QGuiApplication.clipboard().setText(text)
+        short = text if len(text) <= 40 and "\n" not in text else text.splitlines()[0][:40] + "…"
+        self.statusBar().showMessage(
+            f"Copied {key}: “{short}”. Select a tag (in any song) and press Ctrl+V to "
+            "paste it.", 6000)
+
+    def paste_value(self):
+        """Paste the clipboard text into the selected tags of every selected file."""
+        files = self.selected_files()
+        rows = self._chosen_rows()
+        text = QGuiApplication.clipboard().text()
+        if text.endswith("\n") and text.count("\n") == 1:
+            text = text[:-1]
+        if not files or not rows:
+            return
+        if text == "":
+            self.statusBar().showMessage("Nothing to paste: copy a tag's value first "
+                                         "(Ctrl+C)", 5000)
+            return
+        order = self._shown_keys()
+        keys = []
+        for r in rows:
+            meta = self._row_meta(r)
+            kind, key = meta[0], meta[1]
+            for f in files:
+                if kind == "same":
+                    f.set_value(key, meta[2], text)
+                elif f.values(key):
+                    f.replace_all(key, text)
+                else:
+                    f.add(key, text)
+                    f.place(key, order)
+            keys.append(key)
+        self.refresh_table()
+        self._update_labels()
+        n = len(files)
+        self.statusBar().showMessage(
+            f"Pasted into {', '.join(dict.fromkeys(keys))}"
+            + (f" in {n} files" if n > 1 else "") + " — not saved yet", 6000)
+
+    def clear_selected_values(self):
+        files = self.selected_files()
+        rows = {i.row() for i in self.table.selectedIndexes()} or (
+            {self.table.currentRow()} if self.table.currentRow() >= 0 else set())
+        done = False
+        for r in sorted(rows):
+            kind, key = self._row_meta(r)[:2]
+            if kind == "same":
+                for f in files:
+                    f.set_value(key, self._row_meta(r)[2], "")
+                done = True
+            elif kind == "mixed":
+                for f in files:
+                    if f.values(key):
+                        f.replace_all(key, "")
+                done = True
+        if done:
+            self.refresh_table()
+            self._update_labels()
+            self.statusBar().showMessage(
+                "Emptied — the tags stay in the files with no value. "
+                "Delete takes a tag out completely.", 6000)
+
+    def apply_preset_order(self):
+        """Put the preset's tags first, in its order; the rest follow."""
+        preset = self.active_preset_tags()
+        files = self.selected_files()
+        if not preset or not files:
+            return
+        changed = 0
+        for f in files:
+            before = list(f.tags)
+            f.reorder(preset + [k for k, _ in f.tags if k not in preset])
+            changed += f.tags != before
+        self._moved_order = None
+        self.refresh_table()
+        self._update_labels()
+        n = len(files)
+        if changed:
+            msg = (f"Tags put in the order of “{self.store.active}” in {changed} "
+                   f"file{'s' if changed != 1 else ''} — not saved yet")
+            fixed = sorted({f.format_name for f in files if f.kind in ("mp3", "mp4")})
+            if fixed:
+                msg += f" ({' and '.join(fixed)} files keep their own order)"
+        else:
+            msg = ("The tags are already in the preset's order"
+                   + (f" in all {n} files" if n > 1 else ""))
+        self.statusBar().showMessage(msg, 8000)
+
+    def remove_selected_tags(self):
+        """Delete the selected tags. Deleted preset tags aren't offered to fill in again."""
+        files = self.selected_files()
+        rows = {i.row() for i in self.table.selectedIndexes()} or (
+            {self.table.currentRow()} if self.table.currentRow() >= 0 else set())
         metas = [self._row_meta(r) for r in rows]
+        preset = self.active_preset_tags()
+        for f in files:
+            if not hasattr(f, "deleted_keys"):
+                f.deleted_keys = set()
+            f.deleted_keys |= {mm[1] for mm in metas if mm[1] in preset}
+        if any(mm[0] == "missing" for mm in metas):
+            self.refresh_table()
         # Remove later entries first so the positions of earlier ones don't shift
         metas.sort(key=lambda m: -(m[2] if m[0] == "same" else -1))
         for m in metas:
@@ -3706,6 +4317,8 @@ class TagEditor(QMainWindow):
         has = self.store.active in self.store.presets
         self.preset_edit_btn.setEnabled(has)
         self.preset_delete_btn.setEnabled(has)
+        self.act_preset_order.setEnabled(has)
+        self.act_preset_update.setEnabled(has)
 
     def _preset_chosen(self, name):
         self.store.active = name if name in self.store.presets else None
@@ -3715,13 +4328,84 @@ class TagEditor(QMainWindow):
         self._announce_missing()
 
     def _announce_missing(self):
-        missing = sum(1 for r in range(self.table.rowCount())
-                      if self._row_meta(r)[0] == "missing")
+        n = len(self._fill_rows())
         if self.store.active and self.selected_files():
             self.statusBar().showMessage(
-                f"{missing} tag{'s' if missing != 1 else ''} from the preset "
-                f"{'are' if missing != 1 else 'is'} missing — highlighted, ready to fill in"
-                if missing else "This file already has every tag in the preset", 6000)
+                f"{n} tag{'s' if n != 1 else ''} from the preset "
+                f"need{'' if n != 1 else 's'} filling in — shown in yellow. Click "
+                f"“{n} to fill in” to go through {'them' if n != 1 else 'it'}."
+                if n else ("These files already have" if len(self.selected_files()) > 1
+                           else "This file already has") + " every tag in the preset filled in",
+                6000)
+
+    def export_presets(self):
+        if not self.store.presets:
+            QMessageBox.information(self, "Export presets", "There are no presets to export.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export presets", os.path.join(os.path.expanduser("~"), "tagwell-presets.json"),
+            "Tagwell presets (*.json)")
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"tagwell_presets": 1, "presets": self.store.presets}, fh, indent=2)
+        except OSError as e:
+            QMessageBox.warning(self, "Export presets", f"Couldn't save the file:\n{e}")
+            return
+        n = len(self.store.presets)
+        self.statusBar().showMessage(
+            f"Exported {n} preset{'s' if n != 1 else ''} to {os.path.basename(path)}", 6000)
+
+    def import_presets(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import presets", os.path.expanduser("~"), "Tagwell presets (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as fh:
+                raw = json.load(fh).get("presets", {})
+            found = {str(name).strip(): [str(t).strip().upper() for t in tags]
+                     for name, tags in raw.items()}
+            found = {name: [t for t in tags if valid_tag_name(t)]
+                     for name, tags in found.items() if name}
+        except (OSError, ValueError, AttributeError, TypeError) as e:
+            QMessageBox.warning(self, "Import presets",
+                                f"That isn't a Tagwell presets file:\n{e}")
+            return
+        if not found:
+            QMessageBox.information(self, "Import presets", "There are no presets in that file.")
+            return
+        clash = [n for n in found if n in self.store.presets and self.store.presets[n] != found[n]]
+        replace = False
+        if clash:
+            box = QMessageBox(self)
+            box.setWindowTitle("Import presets")
+            box.setIcon(QMessageBox.Question)
+            box.setText(f"{len(clash)} of the presets have the same name as yours "
+                        "but different tags.")
+            box.setInformativeText(", ".join(clash[:8]) + (", …" if len(clash) > 8 else ""))
+            replace_btn = box.addButton("Replace Mine", QMessageBox.AcceptRole)
+            keep_btn = box.addButton("Keep Mine", QMessageBox.RejectRole)
+            box.addButton(QMessageBox.Cancel)
+            box.setDefaultButton(keep_btn)
+            box.exec()
+            if box.clickedButton() not in (replace_btn, keep_btn):
+                return
+            replace = box.clickedButton() is replace_btn
+        added = [n for n in found if n not in self.store.presets]
+        for name, tags in found.items():
+            if name not in self.store.presets or replace:
+                self.store.presets[name] = tags
+        self._save_presets()
+        self._fill_preset_combo(self.store.active)
+        self.refresh_table()
+        changed = len(added) + (len(clash) if replace else 0)
+        self.statusBar().showMessage(
+            f"Imported {changed} preset{'s' if changed != 1 else ''}" if changed
+            else "Nothing new to import: you already have these presets", 6000)
 
     def _save_presets(self):
         try:
@@ -3752,6 +4436,51 @@ class TagEditor(QMainWindow):
                 tags.append(k)
         self._edit_preset_dialog("", tags)
 
+    def update_preset(self):
+        """Save the order shown into the preset, optionally adding the other tags."""
+        name = self.store.active
+        old = self.active_preset_tags()
+        shown = self._shown_keys()
+        if not name or not shown:
+            return
+        reordered = [k for k in shown if k in old] + [k for k in old if k not in shown]
+        extra = [k for k in shown if k not in old]
+        box = QMessageBox(self)
+        box.setWindowTitle("Update preset")
+        box.setIcon(QMessageBox.Question)
+        box.setText(f"Update “{name}” to match the tags shown?")
+        order_btn = box.addButton("Save", QMessageBox.AcceptRole)
+        all_btn = None
+        if extra:
+            box.setInformativeText(
+                "Save keeps the same tags in the preset, in the order shown now.\n\n"
+                f"Save and Add Tags also adds the {len(extra)} other tag"
+                f"{'s' if len(extra) != 1 else ''} shown ({', '.join(extra[:6])}"
+                f"{', …' if len(extra) > 6 else ''}).")
+            all_btn = box.addButton("Save and Add Tags", QMessageBox.AcceptRole)
+        else:
+            box.setInformativeText("The preset keeps the same tags, in the order shown now.")
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(order_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is order_btn:
+            new = reordered
+        elif all_btn is not None and clicked is all_btn:
+            new = [k for k in shown if k in old or k in extra] + \
+                  [k for k in old if k not in shown]
+        else:
+            return
+        if new == old:
+            self.statusBar().showMessage(f"“{name}” already has that order", 4000)
+            return
+        self.store.presets[name] = new
+        self._save_presets()
+        self._moved_order = None
+        self.refresh_table()
+        self.statusBar().showMessage(
+            f"Preset “{name}” updated. Ctrl+R puts other songs in this order.", 8000)
+
     def edit_preset(self):
         if self.store.active:
             self._edit_preset_dialog(self.store.active, self.active_preset_tags())
@@ -3775,8 +4504,78 @@ class TagEditor(QMainWindow):
         else:
             self.remove_selected_tags()
 
-    # ------------------------------------------------------------ state
+    # ------------------------------------------------------------ undo
+    UNDO_LIMIT = 100
+
+    @staticmethod
+    def _sig(f):
+        return (tuple(f.tags), tuple(map(id, f.pics)),
+                frozenset(getattr(f, "deleted_keys", ())), frozenset(getattr(f, "kept_keys", ())))
+
+    @staticmethod
+    def _snap(f):
+        return (f, list(f.tags), list(f.pics), set(getattr(f, "deleted_keys", ())),
+                set(getattr(f, "kept_keys", ())))
+
+    def _track_changes(self):
+        """Put the previous state on the undo list if any file changed."""
+        if getattr(self, "_restoring", False):
+            return
+        if not hasattr(self, "_undo"):
+            self._undo, self._redo, self._last = [], [], {}
+        now = {id(f): self._sig(f) for f in self.files}
+        if any(k in now and now[k] != sig for k, (sig, _) in self._last.items()):
+            before = [snap for k, (sig, snap) in self._last.items()
+                      if k in now and now[k] != sig]
+            self._undo.append(before)
+            del self._undo[:-self.UNDO_LIMIT]
+            self._redo.clear()
+        self._last = {id(f): (now[id(f)], self._snap(f)) for f in self.files}
+        self.act_undo.setEnabled(bool(self._undo))
+        self.act_redo.setEnabled(bool(self._redo))
+
+    def _restore(self, snaps):
+        """Restore a snapshot; returns snapshots of the current state."""
+        current = []
+        for f, tags, pics, deleted, kept in snaps:
+            if f not in self.files:
+                continue
+            current.append(self._snap(f))
+            f.tags, f.pics = list(tags), list(pics)
+            f.deleted_keys, f.kept_keys = set(deleted), set(kept)
+        self._restoring = True
+        try:
+            self._moved_order = None
+            self.refresh_table()
+            self._update_labels()
+        finally:
+            self._restoring = False
+        self._last = {id(f): (self._sig(f), self._snap(f)) for f in self.files}
+        return current
+
+    def undo(self):
+        if getattr(self, "_undo", None):
+            snaps = self._undo.pop()
+            self._redo.append(self._restore(snaps))
+            self._undo_note("Undone", snaps)
+
+    def redo(self):
+        if getattr(self, "_redo", None):
+            snaps = self._redo.pop()
+            self._undo.append(self._restore(snaps))
+            self._undo_note("Redone", snaps)
+
+    def _undo_note(self, what, snaps):
+        n = len(snaps)
+        self.act_undo.setEnabled(bool(self._undo))
+        self.act_redo.setEnabled(bool(self._redo))
+        self.statusBar().showMessage(
+            f"{what} ({n} file{'s' if n != 1 else ''})" +
+            (f" — {len(self._undo)} more to undo" if what == "Undone" and self._undo else ""),
+            4000)
+
     def _update_labels(self):
+        self._track_changes()
         self._refresh_tag_combo()
         for r, f in enumerate(self.files):
             item = self.file_list.item(r)
@@ -3829,8 +4628,7 @@ class TagEditor(QMainWindow):
             event.ignore()
 
     # ------------------------------------------------------------ drag & drop
-    # Dolphin and other KDE apps hand files to sandboxed apps (snaps, Flatpaks)
-    # through the desktop's file-transfer portal instead of a plain file list.
+    # Dolphin hands files to snaps and Flatpaks through the file-transfer portal.
     PORTAL_MIME = "application/vnd.portal.filetransfer"
 
     def _drop_debug(self, what, md):
@@ -3878,7 +4676,7 @@ class TagEditor(QMainWindow):
                 return []
             args = reply.arguments()
             return [str(p) for p in (args[0] if args else [])]
-        except Exception as e:  # never let a drop crash the app
+        except Exception as e:  # a bad drop must not crash the app
             if os.environ.get("TAGWELL_DEBUG"):
                 print(f"[drop] portal failed: {e}", file=sys.stderr, flush=True)
             return []
@@ -3915,7 +4713,7 @@ class TagEditor(QMainWindow):
             self.import_picture(images[0])
 
     def _take_web_picture(self, found):
-        """A picture dragged in from a web browser: download it, then import it."""
+        """Download a picture dropped from a browser and import it."""
         if not self.selected_files():
             QMessageBox.information(self, "Import picture",
                                     "Select the file(s) to add the picture to first.")
@@ -3936,9 +4734,8 @@ class TagEditor(QMainWindow):
 
 
 # ---------------------------------------------------------------- single instance
-# Opening several files from a file manager often starts the app once per file.
-# The first copy becomes the window; every later copy hands its files to it and
-# quits, so all the files end up in one window.
+# Opening several files from a file manager can start the app once per file.
+# The first copy opens the window; the others pass their files to it and quit.
 INSTANCE_NAME = f"tagwell-{os.getuid()}"
 
 

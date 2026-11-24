@@ -17,7 +17,14 @@ FLAC, MP3, M4A (AAC/ALAC), OGG Vorbis and Opus files, one song or a whole album 
 - Edit many files at once, even of different formats: rows that differ between files
   show as *&lt;different in each file&gt;*
 - Rename a tag, or copy it into another tag, keeping each file's own value
-- Presets: save the tags you always use, and missing ones show up as highlighted blank rows
+- Change the order of the tags (kept in FLAC, OGG and Opus files)
+- Copy a tag's value and paste it into any tag of any song
+- Undo and redo every change before you save
+- Presets: save the tags you always use, in the order you like, and check your songs
+  against them. Tags are coloured when they need a look, with a one-click fix for each:
+  - **yellow**: in the preset but missing or empty (fill them in one after another)
+  - **red**: not in the preset (remove them, or choose to keep one)
+  - **blue**: not in the preset's order (put them in order)
 - Choose whether blank tags are saved or left out
 - Cover art: view, import, export, remove and set the picture type, or find covers online
   from the [Cover Art Archive](https://coverartarchive.org) (MusicBrainz)
@@ -78,7 +85,15 @@ entry is in `packaging/tagwell.desktop`.
 | Add a tag | Type a name and value under the tag list and press Add Tag, or Ctrl+T |
 | Rename a tag | Select it and press Rename… or F2 |
 | Select several tags | Ctrl-click, Shift-click, or drag across them |
-| Use a preset | Pick it from the Preset list; New… makes one from scratch |
+| Change the order of tags | Select them and press the up and down arrows, or Alt+Up / Alt+Down |
+| Copy and paste a value | Select a tag and press Ctrl+C, then select a tag (in any song) and press Ctrl+V |
+| Empty a tag, or delete it | Remove Value keeps the tag with nothing in it; Delete takes it out completely |
+| Undo a change | Ctrl+Z (Ctrl+Shift+Z to redo), or the arrows under the tag list |
+| Use a preset | Pick it from the Preset list; New… makes one from the tags shown, Edit… changes it |
+| Save a new tag order into the preset | Arrange the tags, then Update… → Save (Save and Add Tags also adds the other tags shown) |
+| Fix what the preset check found | Click the yellow, red or blue button above the tags; More info explains them |
+| Keep a tag that isn't in the preset | Right-click it and choose Keep Tag |
+| Back up or move your presets | The ☰ button at the end of the preset bar: Export Presets… or Import Presets… |
 | Change the cover | Import…, Export…, Remove or Find Cover Online… under the picture |
 | Use a cover from the web | Find Cover Online… → Search the Web…, then drag the picture in; or drag a picture from your browser straight onto Tagwell |
 | Get lyrics | Lyrics… under the tag list |
